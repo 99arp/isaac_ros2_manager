@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+import json
+import os
+
+import rclpy
+from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import PackageNotFoundError
+from geometry_msgs.msg import PoseStamped, Twist
+from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+from webots_ros2_manager_msgs.action import MoveToArea, SweepArea
+
+from .agent_bridge_node import AgentBridge, AgentBridgeConfig
+from .common import (
+    MissionModel,
+    gps_to_dict,
+    join_name,
+    lat_lon_from_xy,
+    odom_to_dict,
+    param_bool,
+    param_float_array,
+    resolve_proto,
+)
+
+try:
+    from . import auspex_compat
+except Exception:
+    auspex_compat = None
+
+try:
+    from simulation_interfaces.srv import SpawnEntity
+except Exception:
+    SpawnEntity = None
+
+
+class IsaacTeamManager(Node):
+    """Launch a Webots-style team into Isaac Sim and bridge per-agent control.
+
+    Reads the same team JSON the Webots stack uses, maps each agent's proto/kind
+    onto an Isaac world_manager spawn request, places it at its named location,
+    and stands up an AgentBridge so the upstream managers can drive it.
+    """
+
+    def __init__(self):
+        super().__init__("team_manager")
+        self.cb_group = ReentrantCallbackGroup()
+
+        self.declare_parameter("team_json", "None")
+        self.declare_parameter("grid_size", 1)
+        self.declare_parameter("edge_size", 250.0)
+        self.declare_parameter("world_offset", [0.0, 0.0], descriptor=ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter("spawn", True)
+        self.declare_parameter("spawn_with_isaac", True)
+        self.declare_parameter("auto_update_db", True)
+        self.declare_parameter("goal_tolerance", 1.0)
+        self.declare_parameter("goal_timeout_sec", 120.0)
+        self.declare_parameter("origin_lat", 0.0)
+        self.declare_parameter("origin_lon", 0.0)
+        self.declare_parameter("origin_alt", 0.0)
+        self.declare_parameter("spawn_alt", 1.0)
+        self.declare_parameter("odom_timeout_sec", 1.0)
+        self.declare_parameter("synthetic_odom", True)
+
+        team_json = self._resolve_team_json(str(self.get_parameter("team_json").value))
+        with open(team_json, "r", encoding="utf-8") as f:
+            self.team_dict = json.load(f)
+        self.team_json = team_json
+        self.team_name = self.team_dict["name"]
+        self.agents = self.team_dict.get("agents", {})
+
+        self.grid_size = int(self.get_parameter("grid_size").value)
+        self.edge_size = float(self.get_parameter("edge_size").value)
+        self.world_offset = param_float_array(self.get_parameter("world_offset").value)
+        if len(self.world_offset) < 2 and "area_offset" in self.team_dict:
+            self.world_offset = list(self.team_dict["area_offset"])
+        self.mission = MissionModel.build(self.grid_size, self.edge_size, self.world_offset)
+        self.current_area_id = self.team_dict.get("area") or next(iter(self.mission.areas.keys()))
+
+        self.origin_lat = float(self.get_parameter("origin_lat").value)
+        self.origin_lon = float(self.get_parameter("origin_lon").value)
+        self.origin_alt = float(self.get_parameter("origin_alt").value)
+        self.spawn_alt = float(self.get_parameter("spawn_alt").value)
+        self.has_geo_origin = self.origin_lat != 0.0 or self.origin_lon != 0.0
+
+        self.spawn_requested = param_bool(self.get_parameter("spawn").value)
+        self.spawn_with_isaac = param_bool(self.get_parameter("spawn_with_isaac").value)
+        self.auto_update_db = param_bool(self.get_parameter("auto_update_db").value)
+        self.spawned_agents: set[str] = set()
+
+        self.spawn_client = None
+        if SpawnEntity is not None and self.spawn_with_isaac:
+            self.spawn_client = self.create_client(SpawnEntity, "/world_manager/add", callback_group=self.cb_group)
+        elif self.spawn_with_isaac:
+            self.get_logger().warning("simulation_interfaces/srv/SpawnEntity is unavailable; using bridge-only mode")
+
+        self.db_client = None
+        if auspex_compat is not None and self.auto_update_db:
+            self.db_client = auspex_compat.make_write_client(self, callback_group=self.cb_group)
+
+        self.bridges: dict[str, AgentBridge] = {}
+        self._create_agent_bridges()
+
+        self.create_service(Trigger, "~/spawn_team", self._spawn_team_cb, callback_group=self.cb_group)
+        self.move_to_area_action = ActionServer(
+            self,
+            MoveToArea,
+            "move_to_area",
+            execute_callback=self._move_to_area_cb,
+            callback_group=self.cb_group,
+        )
+        self.sweep_area_action = ActionServer(
+            self,
+            SweepArea,
+            "sweep_area",
+            execute_callback=self._sweep_area_cb,
+            callback_group=self.cb_group,
+        )
+
+        if self.spawn_requested:
+            self.spawn_retry_timer = self.create_timer(2.0, self._spawn_missing_agents, callback_group=self.cb_group)
+        else:
+            self.spawn_retry_timer = None
+        if self.db_client is not None:
+            self.create_timer(1.0, self._update_db, callback_group=self.cb_group)
+
+        self.get_logger().info(
+            f"Isaac team_manager ready for team '{self.team_name}' with agents={list(self.agents.keys())};"
+            f" spawn_with_isaac={self.spawn_with_isaac}; geo_origin={self.has_geo_origin}"
+        )
+
+    def _resolve_team_json(self, value: str) -> str:
+        if value and value != "None" and os.path.isfile(value):
+            return value
+        if value and value != "None":
+            for package_name in ("chipgt_bringup", "webots_ros2_manager"):
+                try:
+                    package_dir = get_package_share_directory(package_name)
+                except PackageNotFoundError:
+                    continue
+                candidate = os.path.join(package_dir, "teams", value + ".json")
+                if os.path.isfile(candidate):
+                    return candidate
+        raise ValueError("team_json must be an existing JSON file or an installed team name")
+
+    def _agent_initial_pose(self, index: int, agent: dict) -> tuple[float, float, float]:
+        """Local ENU metres for an agent, from its named location when known.
+
+        Falls back to an explicit team start offset, then to deterministic
+        per-index stacking inside the current area.
+        """
+        located = self.mission.location_xy(agent.get("location"))
+        if located is not None:
+            # Several agents commonly share a named init location; fan them out
+            # deterministically by index so they do not spawn on top of each other.
+            return located[0], located[1] + index * 2.0, 0.0
+        if self.team_dict.get("webots__start_offset") is not None:
+            base_x = float(self.team_dict["webots__start_offset"][0])
+            base_y = float(self.team_dict["webots__start_offset"][1])
+        else:
+            area = self.mission.areas.get(self.current_area_id) or next(iter(self.mission.areas.values()))
+            base_x = area.offset[0] + min(3.0, area.size[0] * 0.2)
+            base_y = area.offset[1] + min(3.0, area.size[1] * 0.2)
+        return base_x, base_y + index * 2.0, 0.0
+
+    def _create_agent_bridges(self) -> None:
+        for index, (agent_name, agent) in enumerate(self.agents.items()):
+            ns = join_name(self.team_name, agent_name)
+            x, y, z = self._agent_initial_pose(index, agent)
+            kind = resolve_proto(agent).kind
+            if kind == "ugv":
+                odom_topics = (join_name(ns, "chassis", "odom"),)
+            else:
+                odom_topics = (join_name(ns, "odom"),)
+            config = AgentBridgeConfig(
+                agent_namespace=ns,
+                kind=kind,
+                isaac_cmd_vel_topic=join_name(ns, "cmd_vel"),
+                isaac_odom_topics=odom_topics,
+                set_target_topic=join_name(ns, "set_target"),
+                initial_x=x,
+                initial_y=y,
+                initial_z=z,
+                origin_lat=self.origin_lat,
+                origin_lon=self.origin_lon,
+                origin_alt=self.origin_alt,
+                odom_timeout_sec=float(self.get_parameter("odom_timeout_sec").value),
+                synthetic_odom=param_bool(self.get_parameter("synthetic_odom").value),
+                goal_tolerance=float(self.get_parameter("goal_tolerance").value),
+                goal_timeout_sec=float(self.get_parameter("goal_timeout_sec").value),
+            )
+            self.bridges[agent_name] = AgentBridge(self, config)
+
+    def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        self.spawn_requested = True
+        self._spawn_missing_agents()
+        response.success = True
+        response.message = f"Spawn requested for team {self.team_name}; bridge topics are already active."
+        return response
+
+    def _spawn_missing_agents(self) -> None:
+        if not self.spawn_with_isaac or self.spawn_client is None:
+            return
+        if len(self.spawned_agents) == len(self.agents):
+            if self.spawn_retry_timer is not None:
+                self.spawn_retry_timer.cancel()
+            return
+        if not self.spawn_client.service_is_ready() and not self.spawn_client.wait_for_service(timeout_sec=0.01):
+            self.get_logger().warning("Waiting for /world_manager/add to spawn missing team agents")
+            return
+        for index, (agent_name, agent) in enumerate(self.agents.items()):
+            if agent_name in self.spawned_agents:
+                continue
+            request = self._spawn_request(index, agent_name, agent)
+            future = self.spawn_client.call_async(request)
+            future.add_done_callback(lambda fut, name=agent_name: self._spawn_done(name, fut))
+
+    def _spawn_request(self, index: int, agent_name: str, agent: dict) -> "SpawnEntity.Request":
+        x, y, z = self._agent_initial_pose(index, agent)
+        spec = resolve_proto(agent)
+        namespace = f"{self.team_name}/{agent_name}"
+
+        request = SpawnEntity.Request()
+        request.name = f"{self.team_name}_{agent_name}"
+        request.entity_namespace = namespace
+        request.allow_renaming = True
+        request.uri = spec.uri
+        request.initial_pose.header.frame_id = "map"
+        request.initial_pose.pose.orientation.w = 1.0
+
+        payload = dict(spec.resource)
+        payload.setdefault("spawn_in_glade", False)
+
+        if self.has_geo_origin:
+            # Place by GPS (what the world_manager spawners document); keep the
+            # pose-message position at the origin so it is not double-applied.
+            lat, lon, alt = lat_lon_from_xy(
+                x, y, self.origin_lat, self.origin_lon, self.origin_alt, z
+            )
+            payload["lat"] = lat
+            payload["lon"] = lon
+            payload["alt"] = alt + (self.spawn_alt if spec.kind == "uav" else 0.0)
+        else:
+            # No geo-reference: hand the spawner local metres via initial_pose.
+            request.initial_pose.pose.position.x = x
+            request.initial_pose.pose.position.y = y
+            request.initial_pose.pose.position.z = z + (self.spawn_alt if spec.kind == "uav" else 0.0)
+
+        if spec.kind == "uav":
+            backend = dict(payload.get("px4_mavlink_backend") or {})
+            backend.setdefault("vehicle_id", index + 1)
+            backend.setdefault("px4_autolaunch", True)
+            backend.setdefault("enable_lockstep", False)
+            backend.setdefault("num_rotors", int(payload.pop("num_rotors", 4)))
+            payload["px4_mavlink_backend"] = backend
+
+        request.resource_string = json.dumps(payload)
+        return request
+
+    def _spawn_done(self, agent_name: str, future) -> None:
+        try:
+            response = future.result()
+            ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
+            if ok:
+                self.spawned_agents.add(agent_name)
+                self.get_logger().info(f"Spawned Isaac agent {self.team_name}/{agent_name}")
+            else:
+                self.get_logger().warning(
+                    f"Isaac spawn failed for {self.team_name}/{agent_name}: {response.result.error_message}"
+                )
+        except Exception as exc:
+            self.get_logger().warning(f"Isaac spawn call failed for {self.team_name}/{agent_name}: {exc}")
+
+    def _move_to_area_cb(self, goal_handle):
+        request = goal_handle.request
+        area = self.mission.areas.get(request.area_id)
+        if area is None:
+            goal_handle.abort()
+            result = MoveToArea.Result()
+            result.success = False
+            result.message = f"Unknown area {request.area_id!r}"
+            return result
+
+        target = request.position_in_area
+        if target.x == 0.0 and target.y == 0.0:
+            target = area.default_pose()
+        self.current_area_id = area.area_id
+        self._send_team_target(target.x, target.y, target.theta)
+
+        goal_handle.succeed()
+        result = MoveToArea.Result()
+        result.success = True
+        result.message = f"Sent Isaac targets for area {area.area_id}"
+        return result
+
+    def _sweep_area_cb(self, goal_handle):
+        request = goal_handle.request
+        area = self.mission.areas.get(request.area_id) if request.area_id else self.mission.areas.get(self.current_area_id)
+        if area is None:
+            area = next(iter(self.mission.areas.values()))
+        target_agent = request.agent_id or self._first_agent(kind="uav") or self._first_agent()
+        bridge = self.bridges.get(target_agent)
+        result = SweepArea.Result()
+        if bridge is None:
+            goal_handle.abort()
+            result.success = False
+            result.message = "No agent available for sweep"
+            return result
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.pose.position.x = area.offset[0] + area.size[0] * 0.5
+        pose.pose.position.y = area.offset[1] + area.size[1] * 0.5
+        pose.pose.position.z = float(request.altitude or 5.0)
+        pose.pose.orientation.w = 1.0
+        bridge._publish_target(pose)
+        goal_handle.succeed()
+        result.success = True
+        result.message = f"Sent sweep target to {target_agent}"
+        return result
+
+    def _first_agent(self, kind: str | None = None) -> str | None:
+        for name, agent in self.agents.items():
+            if kind is None or resolve_proto(agent).kind == kind:
+                return name
+        return None
+
+    def _send_team_target(self, x: float, y: float, z: float = 0.0) -> None:
+        for offset, bridge in enumerate(self.bridges.values()):
+            pose = PoseStamped()
+            pose.header.frame_id = "map"
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y) + offset * 2.0
+            pose.pose.position.z = float(z)
+            pose.pose.orientation.w = 1.0
+            bridge._publish_target(pose)
+
+    def _platform_entry(self) -> str:
+        data = {"team_id": self.team_name, "agents": {}, "data": {}}
+        for name, agent in self.agents.items():
+            bridge = self.bridges[name]
+            agent_data = dict(agent)
+            agent_data["pose"] = odom_to_dict(bridge.current_odom)
+            agent_data["gps"] = gps_to_dict(bridge.current_gps())
+            data["agents"][name] = agent_data
+        area = self.mission.areas.get(self.current_area_id)
+        if area is not None:
+            data["data"]["area"] = {
+                "id": area.area_id,
+                "offset": list(area.offset),
+                "bounds": area.bounds,
+            }
+        return json.dumps(data)
+
+    def _update_db(self) -> None:
+        if self.db_client is None:
+            return
+        if not self.db_client.service_is_ready() and not self.db_client.wait_for_service(timeout_sec=0.01):
+            return
+        self.db_client.call_async(auspex_compat.write_request(
+            "platform", instance_id=self.team_name, entity=self._platform_entry()))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = IsaacTeamManager()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            executor.shutdown()
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
