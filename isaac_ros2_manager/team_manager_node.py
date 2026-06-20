@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import rclpy
+from ample_msgs.action import ExecutePlan
 from ament_index_python.packages import get_package_share_directory
 from ament_index_python.packages import PackageNotFoundError
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from rcl_interfaces.msg import ParameterDescriptor
-from rclpy.action import ActionServer
+from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rosidl_runtime_py.convert import message_to_ordereddict
 from std_srvs.srv import Trigger
 from webots_ros2_manager_msgs.action import MoveToArea, SweepArea
+from yaml import dump
 
 from .agent_bridge_node import AgentBridge, AgentBridgeConfig
 from .common import (
@@ -104,6 +108,13 @@ class IsaacTeamManager(Node):
 
         self.bridges: dict[str, AgentBridge] = {}
         self._create_agent_bridges()
+
+        self.execute_plan_client = ActionClient(
+            self,
+            ExecutePlan,
+            "ample/execute_plan",
+            callback_group=self.cb_group,
+        )
 
         self.create_service(Trigger, "~/spawn_team", self._spawn_team_cb, callback_group=self.cb_group)
         self.move_to_area_action = ActionServer(
@@ -288,14 +299,98 @@ class IsaacTeamManager(Node):
         target = request.position_in_area
         if target.x == 0.0 and target.y == 0.0:
             target = area.default_pose()
-        self.current_area_id = area.area_id
-        self._send_team_target(target.x, target.y, target.theta)
 
-        goal_handle.succeed()
+        if not area.contains(target.x, target.y):
+            goal_handle.abort()
+            result = MoveToArea.Result()
+            result.success = False
+            result.message = "bad area position"
+            return result
+
+        if area.area_id == self.current_area_id:
+            goal_handle.succeed()
+            result = MoveToArea.Result()
+            result.success = True
+            result.message = "arrived"
+            return result
+
+        if not self.execute_plan_client.wait_for_server(timeout_sec=5.0):
+            goal_handle.abort()
+            result = MoveToArea.Result()
+            result.success = False
+            result.message = "AMPLE not reached"
+            return result
+
+        plan_goal = ExecutePlan.Goal()
+        plan_goal.plan_as_string, plan_goal.plan_input_yaml = self._move_to_area_plan(target)
+        plan_goal.plan_type = "rl"
+
+        plan_result, error = self._execute_plan(plan_goal)
         result = MoveToArea.Result()
-        result.success = True
-        result.message = f"Sent Isaac targets for area {area.area_id}"
+        if plan_result is not None and plan_result.success:
+            self.current_area_id = area.area_id
+            goal_handle.succeed()
+            result.success = True
+            result.message = "arrived in new area"
+            return result
+
+        goal_handle.abort()
+        result.success = False
+        result.message = error or getattr(plan_result, "message", "") or "failed to move to new area"
         return result
+
+    def _wait_future(self, future, timeout_sec: float):
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while rclpy.ok() and not future.done():
+            if time.monotonic() >= deadline:
+                return None, "timed out"
+            time.sleep(0.02)
+        if not future.done():
+            return None, "not completed"
+        try:
+            return future.result(), ""
+        except Exception as exc:
+            return None, str(exc)
+
+    def _execute_plan(self, plan_goal: ExecutePlan.Goal):
+        goal_handle, error = self._wait_future(self.execute_plan_client.send_goal_async(plan_goal), 5.0)
+        if goal_handle is None:
+            return None, f"execute_plan goal failed: {error}"
+        if not goal_handle.accepted:
+            return None, "execute_plan goal rejected"
+
+        timeout_sec = max(30.0, len(self.agents) * float(self.get_parameter("goal_timeout_sec").value) + 10.0)
+        result_response, error = self._wait_future(goal_handle.get_result_async(), timeout_sec)
+        if result_response is None:
+            return None, f"execute_plan result failed: {error}"
+        return result_response.result, ""
+
+    def _move_to_area_plan(self, target: Pose2D) -> tuple[str, str]:
+        plan = "parallel move_to_area {\n"
+        sections = {"robot": "", "input": "", "body": ""}
+        inputs = {}
+
+        for offset, (agent_name, agent) in enumerate(self.agents.items()):
+            kind = str(agent.get("kind") or resolve_proto(agent).kind)
+            agent_type = str(agent.get("type") or f"{kind}_ranger")
+            target_pose = Pose2D()
+            target_pose.x = float(target.x)
+            target_pose.y = float(target.y) + offset * 2.0
+            target_pose.theta = float(target.theta)
+
+            sections["robot"] += f"\t\t{agent_name}: {agent_type}\n"
+            sections["input"] += f"\t\ttarget_{agent_name}: Waypoint\n"
+            sections["body"] += (
+                f"\t\tmove_{agent_name} {{ "
+                f"move_{kind}[{agent_name}](target_{agent_name}) success.succeeded"
+                " }\n"
+            )
+            inputs[f"target_{agent_name}"] = dict(message_to_ordereddict(target_pose))
+
+        for key, text in sections.items():
+            plan += f"\t{key} {{\n{text}\t}}\n"
+        plan += "}"
+        return plan, dump(inputs)
 
     def _sweep_area_cb(self, goal_handle):
         request = goal_handle.request

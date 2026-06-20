@@ -16,6 +16,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, Float32MultiArray
 from std_srvs.srv import Trigger
+from webots_ros2_manager_msgs.action import ObjectiveAction
+from webots_ros2_manager_msgs.srv import ObjectiveService
 
 from .common import (
     abs_name,
@@ -50,6 +52,12 @@ class AgentBridgeConfig:
     goal_tolerance: float = 1.0
     goal_timeout_sec: float = 120.0
     publish_rate_hz: float = 20.0
+    objective_service_timeout_sec: float = 5.0
+    cmd_vel_linear_gain: float = 0.8
+    cmd_vel_angular_gain: float = 1.8
+    cmd_vel_max_linear: float = 1.0
+    cmd_vel_max_angular: float = 1.2
+    cmd_vel_heading_tolerance: float = 0.35
 
 
 class AgentBridge:
@@ -80,6 +88,7 @@ class AgentBridge:
         self.pose_output_topic = join_name(self.agent_ns, "pose")
         self.gps_output_topic = join_name(self.agent_ns, "gps")
         self.is_flying_topic = join_name(self.agent_ns, "isFlying")
+        self.is_flying_snake_topic = join_name(self.agent_ns, "is_flying")
 
         odom_topics = config.isaac_odom_topics or (join_name(self.agent_ns, "chassis", "odom"),)
         self.isaac_odom_topics = tuple(dict.fromkeys(odom_topics))
@@ -93,9 +102,8 @@ class AgentBridge:
         self.last_cmd_monotonic = 0.0
         self.is_flying = config.kind == "uav"
 
-        self.cmd_vel_pub = None
+        self.cmd_vel_pub = node.create_publisher(Twist, self.isaac_cmd_vel_topic, 10)
         if self.isaac_cmd_vel_topic != self.webots_cmd_vel_topic:
-            self.cmd_vel_pub = node.create_publisher(Twist, self.isaac_cmd_vel_topic, 10)
             node.create_subscription(
                 Twist,
                 self.webots_cmd_vel_topic,
@@ -120,6 +128,7 @@ class AgentBridge:
         self.pose_pub = node.create_publisher(PoseStamped, self.pose_output_topic, 10)
         self.gps_pub = node.create_publisher(NavSatFix, self.gps_output_topic, 10)
         self.is_flying_pub = node.create_publisher(Bool, self.is_flying_topic, 10)
+        self.is_flying_snake_pub = node.create_publisher(Bool, self.is_flying_snake_topic, 10)
 
         for topic in self.isaac_odom_topics:
             node.create_subscription(
@@ -165,6 +174,30 @@ class AgentBridge:
             self._takeoff_cb,
             callback_group=self.cb_group,
         )
+        self.detect_client = node.create_client(
+            ObjectiveService,
+            "/env_manager/get_objective_type",
+            callback_group=self.cb_group,
+        )
+        self.disarm_client = node.create_client(
+            ObjectiveService,
+            "/env_manager/change_objective_state",
+            callback_group=self.cb_group,
+        )
+        self.detect_action = ActionServer(
+            node,
+            ObjectiveAction,
+            join_name(self.agent_ns, "detect"),
+            execute_callback=self._detect_cb,
+            callback_group=self.cb_group,
+        )
+        self.disarm_action = ActionServer(
+            node,
+            ObjectiveAction,
+            join_name(self.agent_ns, "disarm"),
+            execute_callback=self._disarm_cb,
+            callback_group=self.cb_group,
+        )
 
         period = 1.0 / max(config.publish_rate_hz, 1.0)
         self.timer = node.create_timer(period, self._timer_cb, callback_group=self.cb_group)
@@ -173,7 +206,9 @@ class AgentBridge:
             f" -> {self.isaac_cmd_vel_topic}; odom sources={list(self.isaac_odom_topics)};"
             f" outputs={self.odom_output_topic},{self.odometry_output_topic},{self.odom_matcher_output_topic},"
             f"{self.pose_output_topic},{self.gps_output_topic};"
-            f" set_target={self.set_target_topic}"
+            f" set_target={self.set_target_topic};"
+            f" skill_actions={join_name(self.agent_ns, 'navigate_to_pose')},"
+            f"{join_name(self.agent_ns, 'detect')},{join_name(self.agent_ns, 'disarm')}"
         )
 
     def _publisher_if_needed(self, msg_type, topic: str, source_topics: tuple[str, ...]):
@@ -205,6 +240,11 @@ class AgentBridge:
 
     def _cmd_vel_cb(self, msg: Twist) -> None:
         self._cmd_vel_record_cb(msg)
+        self._safe_publish(self.cmd_vel_pub, msg)
+
+    def _publish_cmd_vel(self, msg: Twist) -> None:
+        self.last_cmd = msg
+        self.last_cmd_monotonic = time.monotonic()
         self._safe_publish(self.cmd_vel_pub, msg)
 
     def _odom_cb(self, msg: Odometry, source: str) -> None:
@@ -283,6 +323,7 @@ class AgentBridge:
         flying = Bool()
         flying.data = bool(self.is_flying)
         self._safe_publish(self.is_flying_pub, flying)
+        self._safe_publish(self.is_flying_snake_pub, flying)
 
     def _publish_target(self, pose: PoseStamped) -> None:
         if not rclpy.ok():
@@ -297,26 +338,23 @@ class AgentBridge:
         self._safe_publish(self.goal_pose_pub, pose)
 
     def _cancel_nav_cb(self, goal_handle) -> CancelResponse:
-        stop = Float32MultiArray()
-        cur = self.current_odom.pose.pose.position
-        stop.data = [float(cur.x), float(cur.y), float(cur.z)]
-        self._safe_publish(self.set_target_pub, stop)
+        self._publish_cmd_vel(Twist())
         return CancelResponse.ACCEPT
 
     def _navigate_cb(self, goal_handle):
         goal = goal_handle.request.pose
         if not goal.header.frame_id:
             goal.header.frame_id = "map"
-        self._publish_target(goal)
 
         start = time.monotonic()
         result = NavigateToPose.Result()
         feedback = NavigateToPose.Feedback()
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
+                self._publish_cmd_vel(Twist())
                 goal_handle.canceled()
                 return result
-            self._publish_target(goal)
+
             feedback.current_pose = self.current_pose()
             feedback.distance_remaining = float(distance_xy(self.current_odom.pose.pose.position, goal.pose.position))
             elapsed = int(time.monotonic() - start)
@@ -324,6 +362,7 @@ class AgentBridge:
             feedback.estimated_time_remaining = Duration(sec=max(0, int(feedback.distance_remaining)), nanosec=0)
             goal_handle.publish_feedback(feedback)
             if feedback.distance_remaining <= self.config.goal_tolerance:
+                self._publish_cmd_vel(Twist())
                 goal_handle.succeed()
                 return result
             if time.monotonic() - start > self.config.goal_timeout_sec:
@@ -331,11 +370,38 @@ class AgentBridge:
                     f"[isaac bridge] {self.agent_ns}: navigate_to_pose timed out"
                     f" at distance {feedback.distance_remaining:.2f}"
                 )
+                self._publish_cmd_vel(Twist())
                 goal_handle.abort()
                 return result
-            time.sleep(0.2)
+            self._drive_toward(goal)
+            time.sleep(0.1)
+        self._publish_cmd_vel(Twist())
         goal_handle.abort()
         return result
+
+    def _angle_error(self, target: float, current: float) -> float:
+        return math.atan2(math.sin(target - current), math.cos(target - current))
+
+    def _drive_toward(self, goal: PoseStamped) -> None:
+        cur = self.current_odom.pose.pose
+        dx = float(goal.pose.position.x) - float(cur.position.x)
+        dy = float(goal.pose.position.y) - float(cur.position.y)
+        distance = math.hypot(dx, dy)
+        desired_yaw = math.atan2(dy, dx)
+        current_yaw = yaw_from_quat(cur.orientation)
+        yaw_error = self._angle_error(desired_yaw, current_yaw)
+
+        cmd = Twist()
+        cmd.angular.z = max(
+            -self.config.cmd_vel_max_angular,
+            min(self.config.cmd_vel_max_angular, self.config.cmd_vel_angular_gain * yaw_error),
+        )
+        if abs(yaw_error) <= self.config.cmd_vel_heading_tolerance:
+            cmd.linear.x = max(
+                0.0,
+                min(self.config.cmd_vel_max_linear, self.config.cmd_vel_linear_gain * distance),
+            )
+        self._publish_cmd_vel(cmd)
 
     def current_pose(self) -> PoseStamped:
         msg = PoseStamped()
@@ -374,6 +440,56 @@ class AgentBridge:
         response.message = "land accepted by Isaac compatibility bridge"
         return response
 
+    def _objective_request(self, goal) -> ObjectiveService.Request:
+        request = ObjectiveService.Request()
+        request.position = goal.position
+        request.name = goal.name
+        return request
+
+    def _wait_future(self, future, timeout_sec: float):
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while rclpy.ok() and not future.done():
+            if time.monotonic() >= deadline:
+                return None, "timed out"
+            time.sleep(0.02)
+        if not future.done():
+            return None, "not completed"
+        try:
+            return future.result(), ""
+        except Exception as exc:
+            return None, str(exc)
+
+    def _call_objective_service(self, client, request: ObjectiveService.Request, service_name: str):
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.5):
+            return None, f"{service_name} is unavailable"
+        future = client.call_async(request)
+        return self._wait_future(future, self.config.objective_service_timeout_sec)
+
+    def _objective_action_cb(self, goal_handle, client, service_name: str):
+        goal = goal_handle.request
+        response, error = self._call_objective_service(client, self._objective_request(goal), service_name)
+        result = ObjectiveAction.Result()
+        if response is None:
+            result.success = False
+            result.message = error or f"{service_name} failed"
+            goal_handle.abort()
+            return result
+
+        result.success = bool(response.success)
+        result.message = response.message
+        result.type = response.type
+        if response.success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return result
+
+    def _detect_cb(self, goal_handle):
+        return self._objective_action_cb(goal_handle, self.detect_client, "/env_manager/get_objective_type")
+
+    def _disarm_cb(self, goal_handle):
+        return self._objective_action_cb(goal_handle, self.disarm_client, "/env_manager/change_objective_state")
+
 
 class IsaacAgentBridgeNode(Node):
     def __init__(self):
@@ -394,6 +510,12 @@ class IsaacAgentBridgeNode(Node):
         self.declare_parameter("goal_tolerance", 1.0)
         self.declare_parameter("goal_timeout_sec", 120.0)
         self.declare_parameter("publish_rate_hz", 20.0)
+        self.declare_parameter("objective_service_timeout_sec", 5.0)
+        self.declare_parameter("cmd_vel_linear_gain", 0.8)
+        self.declare_parameter("cmd_vel_angular_gain", 1.8)
+        self.declare_parameter("cmd_vel_max_linear", 1.0)
+        self.declare_parameter("cmd_vel_max_angular", 1.2)
+        self.declare_parameter("cmd_vel_heading_tolerance", 0.35)
 
         initial_pose = param_float_array(self.get_parameter("initial_pose").value)
         while len(initial_pose) < 3:
@@ -418,6 +540,12 @@ class IsaacAgentBridgeNode(Node):
             goal_tolerance=float(self.get_parameter("goal_tolerance").value),
             goal_timeout_sec=float(self.get_parameter("goal_timeout_sec").value),
             publish_rate_hz=float(self.get_parameter("publish_rate_hz").value),
+            objective_service_timeout_sec=float(self.get_parameter("objective_service_timeout_sec").value),
+            cmd_vel_linear_gain=float(self.get_parameter("cmd_vel_linear_gain").value),
+            cmd_vel_angular_gain=float(self.get_parameter("cmd_vel_angular_gain").value),
+            cmd_vel_max_linear=float(self.get_parameter("cmd_vel_max_linear").value),
+            cmd_vel_max_angular=float(self.get_parameter("cmd_vel_max_angular").value),
+            cmd_vel_heading_tolerance=float(self.get_parameter("cmd_vel_heading_tolerance").value),
         )
         self.bridge = AgentBridge(self, config)
 

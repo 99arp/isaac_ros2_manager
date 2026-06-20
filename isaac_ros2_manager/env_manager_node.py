@@ -155,9 +155,10 @@ class IsaacEnvironmentManager(Node):
             response.success = False
             response.message = "objective not found"
             return response
-        obj.status = Objective.INACTIVE if obj.status == Objective.ACTIVE else Objective.ACTIVE
+        was_active = obj.status == Objective.ACTIVE
+        obj.status = Objective.INACTIVE
         response.success = True
-        response.message = "status changed"
+        response.message = "status changed" if was_active else "status already inactive"
         response.status = obj.status
         response.type = obj.type
         self._update_db()

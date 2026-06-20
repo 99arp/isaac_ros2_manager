@@ -31,9 +31,12 @@ from auspex_msgs.srv import GetAllInstances, UpsertSubframe
 KNOW_NS = "/auspex_know"
 DEFAULT_SUBFRAME = "data"
 
-# old collection name -> new frame name
+# old collection name -> new frame name. Webots/Isaac demo path keeps "platform" as-is
+# so team_manager (rangers), the oracle ("_oracle_" poachers) and the webapp all share one
+# frame. (Mapping platform->uav isolates the team_manager from everyone else -- the bug we
+# hit on the Webots side; AMPLE/oracle/webapp all read the "platform" frame.)
 FRAME_MAP = {
-    "platform": "uav",
+    "platform": "platform",
     "object": "object",
     "mission": "mission",
     "area": "area",
