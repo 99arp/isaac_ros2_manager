@@ -201,7 +201,7 @@ class IsaacTeamManager(Node):
             config = AgentBridgeConfig(
                 agent_namespace=ns,
                 kind=kind,
-                isaac_cmd_vel_topic=join_name(ns, "cmd_vel"),
+                isaac_cmd_vel_topic="/cmd_vel" if kind == "ugv" else join_name(ns, "cmd_vel"),
                 isaac_odom_topics=odom_topics,
                 isaac_pose_topics=pose_topics,
                 set_target_topic=join_name(ns, "set_target"),
@@ -358,7 +358,7 @@ class IsaacTeamManager(Node):
             payload.setdefault("drive_backend", "cmd_vel")
             payload.setdefault("ros_namespace", namespace)
             payload.setdefault("ros_topic_identifier", namespace)
-            payload.setdefault("cmd_vel_topic", join_name(namespace, "cmd_vel"))
+            payload.setdefault("cmd_vel_topic", "/cmd_vel")
 
         request.resource_string = json.dumps(payload)
         return request
