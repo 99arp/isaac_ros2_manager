@@ -70,9 +70,10 @@ class IsaacTeamManager(Node):
         self.declare_parameter("spawn_alt", 1.0)
         self.declare_parameter("odom_timeout_sec", 1.0)
         self.declare_parameter("synthetic_odom", True)
-        self.declare_parameter("spawn_confirm_timeout_sec", 30.0)
-        self.declare_parameter("spawn_max_attempts", 5)
+        self.declare_parameter("spawn_confirm_timeout_sec", 180.0)
+        self.declare_parameter("spawn_max_attempts", 0)
         self.declare_parameter("spawn_retry_period_sec", 2.0)
+        self.declare_parameter("spawn_call_timeout_sec", 10.0)
 
         team_json = self._resolve_team_json(str(self.get_parameter("team_json").value))
         with open(team_json, "r", encoding="utf-8") as f:
@@ -94,8 +95,9 @@ class IsaacTeamManager(Node):
         self.origin_alt = float(self.get_parameter("origin_alt").value)
         self.spawn_alt = float(self.get_parameter("spawn_alt").value)
         self.spawn_confirm_timeout_sec = float(self.get_parameter("spawn_confirm_timeout_sec").value)
-        self.spawn_max_attempts = int(self.get_parameter("spawn_max_attempts").value)
+        self.spawn_max_attempts = max(0, int(self.get_parameter("spawn_max_attempts").value))
         self.spawn_retry_period_sec = max(0.2, float(self.get_parameter("spawn_retry_period_sec").value))
+        self.spawn_call_timeout_sec = max(1.0, float(self.get_parameter("spawn_call_timeout_sec").value))
         self.has_geo_origin = self.origin_lat != 0.0 or self.origin_lon != 0.0
 
         self.spawn_requested = param_bool(self.get_parameter("spawn").value)
@@ -106,6 +108,9 @@ class IsaacTeamManager(Node):
         self.confirmed_agents: set[str] = set()      # real Isaac odom seen -> entity is actually alive
         self.spawn_attempts: dict[str, int] = {}
         self.spawn_ack_monotonic: dict[str, float] = {}
+        self.spawn_call_monotonic: dict[str, float] = {}
+        self.last_spawn_wait_log_monotonic = 0.0
+        self.agent_spawn_wait_log_monotonic: dict[str, float] = {}
 
         self.spawn_client = None
         if SpawnEntity is not None and self.spawn_with_isaac:
@@ -257,6 +262,8 @@ class IsaacTeamManager(Node):
             self.spawned_agents.discard(agent_name)
             self.spawn_attempts.pop(agent_name, None)
             self.spawn_ack_monotonic.pop(agent_name, None)
+            self.spawn_call_monotonic.pop(agent_name, None)
+            self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
         if reset_agents:
             self.get_logger().warning(
                 f"Resetting Isaac spawn retry state for unconfirmed agents: {reset_agents}"
@@ -292,6 +299,7 @@ class IsaacTeamManager(Node):
         for agent_name in self.agents:
             if agent_name not in self.confirmed_agents and self._agent_confirmed(agent_name):
                 self.confirmed_agents.add(agent_name)
+                self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
                 self.get_logger().info(f"Confirmed Isaac agent {self.team_name}/{agent_name} (odom active)")
 
         if len(self.confirmed_agents) == len(self.agents):
@@ -299,40 +307,80 @@ class IsaacTeamManager(Node):
                 self.spawn_retry_timer.cancel()
             return
 
+        now = time.monotonic()
+        self._clear_stale_pending_spawn_calls(now)
+
         if not self.spawn_client.service_is_ready():
-            self.get_logger().warning("Waiting for /world_manager/add to spawn missing team agents")
+            try:
+                self.spawn_client.wait_for_service(timeout_sec=0.0)
+            except Exception:
+                pass
+        if not self.spawn_client.service_is_ready():
+            if now - self.last_spawn_wait_log_monotonic >= 10.0:
+                waiting = self._format_agent_wait_list(
+                    name for name in self.agents if name not in self.confirmed_agents
+                )
+                self.get_logger().warning(
+                    f"Waiting for /world_manager/add before spawning {waiting}"
+                )
+                self.last_spawn_wait_log_monotonic = now
             return
 
-        now = time.monotonic()
         for index, (agent_name, agent) in enumerate(self.agents.items()):
-            if agent_name in self.confirmed_agents or agent_name in self.pending_spawn_agents:
+            if agent_name in self.confirmed_agents:
+                continue
+            if agent_name in self.pending_spawn_agents:
+                started = self.spawn_call_monotonic.get(agent_name, now)
+                self._log_agent_spawn_wait(
+                    agent_name,
+                    now,
+                    f"Waiting for {self._agent_kind_label(agent_name)} spawn service response for "
+                    f"{self.team_name}/{agent_name}; request in flight for {now - started:.0f}s",
+                )
                 continue
             # An accepted spawn that never produced telemetry within the confirm
             # window almost certainly failed in the background (e.g. the scene was
             # not ready). Drop the stale ack so it gets re-requested below.
             if agent_name in self.spawned_agents:
-                if now - self.spawn_ack_monotonic.get(agent_name, now) < self.spawn_confirm_timeout_sec:
+                accepted_for = now - self.spawn_ack_monotonic.get(agent_name, now)
+                if accepted_for < self.spawn_confirm_timeout_sec:
+                    self._log_agent_spawn_wait(
+                        agent_name,
+                        now,
+                        f"Waiting for {self._agent_kind_label(agent_name)} spawn confirmation for "
+                        f"{self.team_name}/{agent_name}; accepted {accepted_for:.0f}s ago; "
+                        f"waiting for telemetry on {self._agent_confirmation_topic(agent_name)}",
+                    )
                     continue
                 self.spawned_agents.discard(agent_name)
                 self.get_logger().warning(
                     f"Isaac agent {self.team_name}/{agent_name} accepted but no odom after "
                     f"{self.spawn_confirm_timeout_sec:.0f}s; re-requesting spawn"
                 )
-            if self.spawn_attempts.get(agent_name, 0) >= self.spawn_max_attempts:
+            if self.spawn_max_attempts > 0 and self.spawn_attempts.get(agent_name, 0) >= self.spawn_max_attempts:
+                self._log_agent_spawn_wait(
+                    agent_name,
+                    now,
+                    f"Waiting for manual spawn reset for {self._agent_kind_label(agent_name)} "
+                    f"{self.team_name}/{agent_name}; max attempts reached "
+                    f"({self.spawn_attempts.get(agent_name, 0)}/{self.spawn_max_attempts})",
+                )
                 continue
             request = self._spawn_request(index, agent_name, agent)
             self.pending_spawn_agents.add(agent_name)
+            self.spawn_call_monotonic[agent_name] = now
             self.spawn_attempts[agent_name] = self.spawn_attempts.get(agent_name, 0) + 1
             self.get_logger().info(
                 f"Requesting Isaac spawn for {self.team_name}/{agent_name} "
-                f"({request.uri}, attempt {self.spawn_attempts[agent_name]}/{self.spawn_max_attempts})"
+                f"({request.uri}, {self._spawn_attempt_text(agent_name)})"
             )
             future = self.spawn_client.call_async(request)
             future.add_done_callback(lambda fut, name=agent_name: self._spawn_done(name, fut))
 
-        # Stop retrying only when every agent is either confirmed or has exhausted
-        # its attempts (and nothing is still in flight).
-        if not self.pending_spawn_agents and all(
+        # In the default unlimited mode, keep the timer alive until every agent
+        # has real Isaac telemetry. With an explicit finite max, preserve the old
+        # stop behavior once all remaining agents are exhausted.
+        if self.spawn_max_attempts > 0 and not self.pending_spawn_agents and all(
             name in self.confirmed_agents or self.spawn_attempts.get(name, 0) >= self.spawn_max_attempts
             for name in self.agents
         ):
@@ -343,6 +391,57 @@ class IsaacTeamManager(Node):
                 self.get_logger().error(
                     f"Giving up spawning Isaac agents after {self.spawn_max_attempts} attempts: {unconfirmed}"
                 )
+
+    def _clear_stale_pending_spawn_calls(self, now: float) -> None:
+        for agent_name in list(self.pending_spawn_agents):
+            started = self.spawn_call_monotonic.get(agent_name)
+            if started is None or now - started < self.spawn_call_timeout_sec:
+                continue
+            self.pending_spawn_agents.discard(agent_name)
+            self.spawn_call_monotonic.pop(agent_name, None)
+            self.get_logger().warning(
+                f"Isaac spawn service call for {self.team_name}/{agent_name} did not return after "
+                f"{self.spawn_call_timeout_sec:.0f}s; retrying"
+            )
+
+    def _log_agent_spawn_wait(self, agent_name: str, now: float, message: str) -> None:
+        last = self.agent_spawn_wait_log_monotonic.get(agent_name, 0.0)
+        if now - last < 10.0:
+            return
+        self.agent_spawn_wait_log_monotonic[agent_name] = now
+        self.get_logger().warning(message)
+
+    def _format_agent_wait_list(self, agent_names) -> str:
+        parts = [
+            f"{self._agent_kind_label(name)} {self.team_name}/{name}"
+            for name in agent_names
+        ]
+        return ", ".join(parts) if parts else "team agents"
+
+    def _agent_kind_label(self, agent_name: str) -> str:
+        agent = self.agents.get(agent_name, {})
+        spec = resolve_proto(agent)
+        if spec.kind == "uav":
+            return "drone"
+        if spec.uri == "carter":
+            return "Carter"
+        return spec.kind or spec.uri or "agent"
+
+    def _agent_confirmation_topic(self, agent_name: str) -> str:
+        agent = self.agents.get(agent_name, {})
+        spec = resolve_proto(agent)
+        ns = join_name(self.team_name, agent_name)
+        if spec.kind == "uav":
+            return join_name(ns, "pose")
+        if spec.kind == "ugv":
+            return join_name(ns, "chassis", "odom")
+        return join_name(ns, "pose")
+
+    def _spawn_attempt_text(self, agent_name: str) -> str:
+        attempt = self.spawn_attempts.get(agent_name, 0)
+        if self.spawn_max_attempts > 0:
+            return f"attempt {attempt}/{self.spawn_max_attempts}"
+        return f"attempt {attempt}, unlimited retries"
 
     def _spawn_request(self, index: int, agent_name: str, agent: dict) -> "SpawnEntity.Request":
         x, y, z = self._agent_initial_pose(index, agent)
@@ -435,6 +534,7 @@ class IsaacTeamManager(Node):
 
     def _spawn_done(self, agent_name: str, future) -> None:
         self.pending_spawn_agents.discard(agent_name)
+        self.spawn_call_monotonic.pop(agent_name, None)
         try:
             response = future.result()
             ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
