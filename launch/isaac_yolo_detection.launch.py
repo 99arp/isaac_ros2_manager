@@ -23,7 +23,7 @@ def generate_launch_description():
     ])
 
     return LaunchDescription([
-        DeclareLaunchArgument("camera_topic", default_value="/Drone_1/front_camera/image_raw"),
+        DeclareLaunchArgument("camera_topic", default_value="/chipgt/mini1/front_camera/image_raw"),
         DeclareLaunchArgument("detections_topic", default_value=""),
         DeclareLaunchArgument("weights", default_value="/home/qnc/runs/detect/topdown/weights/best.pt"),
         DeclareLaunchArgument("confidence", default_value="0.25"),

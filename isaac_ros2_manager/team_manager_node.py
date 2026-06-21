@@ -339,6 +339,7 @@ class IsaacTeamManager(Node):
 
         if spec.kind == "uav":
             payload.setdefault("aero_platform_id", self._safe_aero_platform_id(namespace))
+            self._ensure_uav_camera_payload(payload, namespace)
             backend = dict(payload.get("px4_mavlink_backend") or {})
             backend.setdefault("vehicle_id", index + 1)
             backend.setdefault("px4_autolaunch", True)
@@ -361,6 +362,38 @@ class IsaacTeamManager(Node):
 
         request.resource_string = json.dumps(payload)
         return request
+
+    def _ensure_uav_camera_payload(self, payload: dict, namespace: str) -> None:
+        sensors = payload.get("sensors")
+        has_camera = isinstance(sensors, dict) and bool(sensors.get("cameras"))
+        if has_camera:
+            return
+
+        camera_topic = join_name(namespace, "front_camera", "image_raw")
+        camera_name = f"{self._safe_aero_platform_id(namespace)}_frontCamera"
+        payload.setdefault("camera_defaults", {"FPS": 10, "Width": 640, "Height": 480})
+        payload["sensors"] = {
+            "publish_mode": "ros",
+            "zmq_base_port": 5555,
+            "cameras": [
+                {
+                    camera_name: {
+                        "type": "camera",
+                        "X": 0.15,
+                        "Y": 0.0,
+                        "Z": 0.0,
+                        "Roll": 0.0,
+                        "Pitch": -90.0,
+                        "Yaw": 0.0,
+                        "fov": 90.0,
+                        "publish_rate": 10,
+                        "publisher": "ros",
+                        "ros2_topic": camera_topic,
+                        "name": camera_name,
+                    }
+                }
+            ],
+        }
 
     def _spawn_done(self, agent_name: str, future) -> None:
         self.pending_spawn_agents.discard(agent_name)

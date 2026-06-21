@@ -33,7 +33,7 @@ class IsaacYoloDetectionAdapter(Node):
         super().__init__("isaac_yolo_detection_adapter")
         self.cb_group = ReentrantCallbackGroup()
 
-        self.declare_parameter("detections_topic", "/Drone_1/front_camera/image_raw/detections")
+        self.declare_parameter("detections_topic", "/chipgt/mini1/front_camera/image_raw/detections")
         self.declare_parameter("odom_topic", "/chipgt/mini1/odometry")
         self.declare_parameter("output_topic", "/chipgt/team_manager/detected_objectives")
         self.declare_parameter("camera_fov_deg", 45.0)
