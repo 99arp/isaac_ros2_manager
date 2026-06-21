@@ -241,22 +241,40 @@ class IsaacTeamManager(Node):
 
     def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.spawn_requested = True
-        reset_agents = self._reset_unconfirmed_spawn_state()
+        reset_agents, waiting_agents = self._reset_stale_unconfirmed_spawn_state()
         self._ensure_spawn_retry_timer()
         self._spawn_missing_agents()
         response.success = True
         response.message = (
-            f"Spawn requested for team {self.team_name}; reset unconfirmed agents={reset_agents}; "
+            f"Spawn requested for team {self.team_name}; reset stale agents={reset_agents}; "
+            f"already waiting={waiting_agents}; "
             "bridge topics are already active."
         )
         return response
 
-    def _reset_unconfirmed_spawn_state(self) -> list[str]:
+    def _reset_stale_unconfirmed_spawn_state(self) -> tuple[list[str], list[str]]:
         reset_agents: list[str] = []
+        waiting_agents: list[str] = []
+        now = time.monotonic()
         for agent_name in self.agents:
             if self._agent_confirmed(agent_name):
                 self.confirmed_agents.add(agent_name)
                 continue
+
+            call_started = self.spawn_call_monotonic.get(agent_name)
+            if agent_name in self.pending_spawn_agents and (
+                call_started is None or now - call_started < self.spawn_call_timeout_sec
+            ):
+                waiting_agents.append(agent_name)
+                continue
+
+            ack_started = self.spawn_ack_monotonic.get(agent_name)
+            if agent_name in self.spawned_agents and (
+                ack_started is None or now - ack_started < self.spawn_confirm_timeout_sec
+            ):
+                waiting_agents.append(agent_name)
+                continue
+
             reset_agents.append(agent_name)
             self.pending_spawn_agents.discard(agent_name)
             self.spawned_agents.discard(agent_name)
@@ -266,9 +284,13 @@ class IsaacTeamManager(Node):
             self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
         if reset_agents:
             self.get_logger().warning(
-                f"Resetting Isaac spawn retry state for unconfirmed agents: {reset_agents}"
+                f"Resetting stale Isaac spawn retry state for unconfirmed agents: {reset_agents}"
             )
-        return reset_agents
+        if waiting_agents:
+            self.get_logger().info(
+                f"Keeping active Isaac spawn waits for unconfirmed agents: {waiting_agents}"
+            )
+        return reset_agents, waiting_agents
 
     def _ensure_spawn_retry_timer(self) -> None:
         if self.spawn_retry_timer is None:
@@ -451,7 +473,7 @@ class IsaacTeamManager(Node):
         request = SpawnEntity.Request()
         request.name = f"{self.team_name}_{agent_name}"
         request.entity_namespace = namespace
-        request.allow_renaming = True
+        request.allow_renaming = False
         request.uri = spec.uri
         request.initial_pose.header.frame_id = "map"
         request.initial_pose.pose.orientation.w = 1.0
