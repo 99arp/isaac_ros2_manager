@@ -81,6 +81,7 @@ class IsaacTeamManager(Node):
         self.team_json = team_json
         self.team_name = self.team_dict["name"]
         self.agents = self.team_dict.get("agents", {})
+        self.uav_vehicle_ids = self._build_uav_vehicle_ids()
 
         self.grid_size = int(self.get_parameter("grid_size").value)
         self.edge_size = float(self.get_parameter("edge_size").value)
@@ -238,6 +239,13 @@ class IsaacTeamManager(Node):
         if text and text[0].isdigit():
             text = f"n_{text}"
         return text or "drone"
+
+    def _build_uav_vehicle_ids(self) -> dict[str, int]:
+        vehicle_ids: dict[str, int] = {}
+        for agent_name, agent in self.agents.items():
+            if resolve_proto(agent).kind == "uav":
+                vehicle_ids[agent_name] = len(vehicle_ids)
+        return vehicle_ids
 
     def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.spawn_requested = True
@@ -500,7 +508,7 @@ class IsaacTeamManager(Node):
             payload.setdefault("aero_platform_id", self._safe_aero_platform_id(namespace))
             self._ensure_uav_camera_payload(payload, namespace)
             backend = dict(payload.get("px4_mavlink_backend") or {})
-            backend.setdefault("vehicle_id", index + 1)
+            backend.setdefault("vehicle_id", self.uav_vehicle_ids.get(agent_name, index))
             backend.setdefault("px4_autolaunch", True)
             backend.setdefault("enable_lockstep", False)
             backend.setdefault("num_rotors", int(payload.pop("num_rotors", 4)))
