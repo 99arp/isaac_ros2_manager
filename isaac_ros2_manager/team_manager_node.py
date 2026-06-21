@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import rclpy
@@ -193,13 +194,16 @@ class IsaacTeamManager(Node):
             kind = resolve_proto(agent).kind
             if kind == "ugv":
                 odom_topics = (join_name(ns, "chassis", "odom"),)
+                pose_topics = ()
             else:
-                odom_topics = (join_name(ns, "odom"),)
+                odom_topics = ()
+                pose_topics = (join_name(ns, "pose"),)
             config = AgentBridgeConfig(
                 agent_namespace=ns,
                 kind=kind,
                 isaac_cmd_vel_topic=join_name(ns, "cmd_vel"),
                 isaac_odom_topics=odom_topics,
+                isaac_pose_topics=pose_topics,
                 set_target_topic=join_name(ns, "set_target"),
                 initial_x=x,
                 initial_y=y,
@@ -211,8 +215,18 @@ class IsaacTeamManager(Node):
                 synthetic_odom=param_bool(self.get_parameter("synthetic_odom").value),
                 goal_tolerance=float(self.get_parameter("goal_tolerance").value),
                 goal_timeout_sec=float(self.get_parameter("goal_timeout_sec").value),
+                aero_platform_id=self._safe_aero_platform_id(ns) if kind == "uav" else "",
             )
             self.bridges[agent_name] = AgentBridge(self, config)
+
+    @staticmethod
+    def _safe_aero_platform_id(value: str | None) -> str:
+        text = str(value or "").strip().strip("/")
+        text = re.sub(r"[^0-9A-Za-z_]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("_")
+        if text and text[0].isdigit():
+            text = f"n_{text}"
+        return text or "drone"
 
     def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.spawn_requested = True
@@ -324,12 +338,16 @@ class IsaacTeamManager(Node):
             request.initial_pose.pose.position.z = z + (self.spawn_alt if spec.kind == "uav" else 0.0)
 
         if spec.kind == "uav":
+            payload.setdefault("aero_platform_id", self._safe_aero_platform_id(namespace))
             backend = dict(payload.get("px4_mavlink_backend") or {})
             backend.setdefault("vehicle_id", index + 1)
             backend.setdefault("px4_autolaunch", True)
             backend.setdefault("enable_lockstep", False)
             backend.setdefault("num_rotors", int(payload.pop("num_rotors", 4)))
             payload["px4_mavlink_backend"] = backend
+        elif spec.kind == "ugv":
+            payload.setdefault("control_mode", "ros2")
+            payload.setdefault("drive_backend", "cmd_vel")
 
         request.resource_string = json.dumps(payload)
         return request

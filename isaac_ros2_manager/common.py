@@ -162,13 +162,13 @@ _PROTO_REGISTRY: dict[str, ProtoSpec] = {
     "scout": ProtoSpec(
         uri="carter",
         kind="ugv",
-        resource={"control_mode": "waypoint", "drive_backend": "cmd_vel", "speed": 1.0},
+        resource={"control_mode": "ros2", "drive_backend": "cmd_vel", "speed": 1.0},
     ),
 }
 
 _KIND_FALLBACK: dict[str, ProtoSpec] = {
     "uav": ProtoSpec(uri="drone", kind="uav", resource={"publish_pose_ros": True, "num_rotors": 4}),
-    "ugv": ProtoSpec(uri="carter", kind="ugv", resource={"control_mode": "waypoint", "drive_backend": "cmd_vel", "speed": 1.0}),
+    "ugv": ProtoSpec(uri="carter", kind="ugv", resource={"control_mode": "ros2", "drive_backend": "cmd_vel", "speed": 1.0}),
 }
 
 
