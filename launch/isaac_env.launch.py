@@ -16,6 +16,7 @@ def generate_launch_description():
         DeclareLaunchArgument("spawn_with_isaac", default_value="True"),
         DeclareLaunchArgument("objective_model", default_value="bear_trap"),
         DeclareLaunchArgument("objective_z_offset", default_value="0.0"),
+        DeclareLaunchArgument("objective_target_length_m", default_value="1.0"),
         Node(
             package="isaac_ros2_manager",
             executable="isaac_env_manager_node",
@@ -30,6 +31,7 @@ def generate_launch_description():
                 "spawn_with_isaac": LaunchConfiguration("spawn_with_isaac"),
                 "objective_model": LaunchConfiguration("objective_model"),
                 "objective_z_offset": LaunchConfiguration("objective_z_offset"),
+                "objective_target_length_m": LaunchConfiguration("objective_target_length_m"),
             }],
         ),
     ])

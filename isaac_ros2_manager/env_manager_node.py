@@ -54,6 +54,7 @@ class IsaacEnvironmentManager(Node):
         self.declare_parameter("spawn_with_isaac", True)
         self.declare_parameter("objective_model", "bear_trap")
         self.declare_parameter("objective_z_offset", 0.0)
+        self.declare_parameter("objective_target_length_m", 1.0)
 
         self.grid_size = int(self.get_parameter("grid_size").value)
         self.edge_size = float(self.get_parameter("edge_size").value)
@@ -64,6 +65,7 @@ class IsaacEnvironmentManager(Node):
         self.spawn_with_isaac = param_bool(self.get_parameter("spawn_with_isaac").value)
         self.objective_model = str(self.get_parameter("objective_model").value)
         self.objective_z_offset = float(self.get_parameter("objective_z_offset").value)
+        self.objective_target_length_m = float(self.get_parameter("objective_target_length_m").value)
         self.mission = MissionModel.build(self.grid_size, self.edge_size, self.world_offset)
         self.objectives: dict[str, Objective] = {}
         self.teams: set[str] = set()
@@ -298,7 +300,7 @@ class IsaacEnvironmentManager(Node):
         request.initial_pose.pose.position.y = float(obj.position.y)
         request.initial_pose.pose.position.z = float(self.ground_z + self.objective_z_offset)
         request.initial_pose.pose.orientation.w = 1.0
-        request.resource_string = json.dumps({
+        resource = {
             "model": self.objective_model,
             "stage_prefix": obj.name,
             "init_pos": [
@@ -307,10 +309,14 @@ class IsaacEnvironmentManager(Node):
                 float(self.ground_z + self.objective_z_offset),
             ],
             "snap_to_terrain": True,
+            "z_offset_m": float(self.objective_z_offset),
             "publish_pose_ros": True,
             "ros_topic_identifier": obj.name,
             "pose_frame_id": "map",
-        })
+        }
+        if self.objective_target_length_m > 0.0:
+            resource["target_length_m"] = float(self.objective_target_length_m)
+        request.resource_string = json.dumps(resource)
         future = self.spawn_client.call_async(request)
         future.add_done_callback(lambda fut, name=obj.name: self._spawn_objective_done(name, fut))
 

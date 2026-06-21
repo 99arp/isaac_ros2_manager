@@ -271,6 +271,10 @@ class IsaacTeamManager(Node):
             request = self._spawn_request(index, agent_name, agent)
             self.pending_spawn_agents.add(agent_name)
             self.spawn_attempts[agent_name] = self.spawn_attempts.get(agent_name, 0) + 1
+            self.get_logger().info(
+                f"Requesting Isaac spawn for {self.team_name}/{agent_name} "
+                f"({request.uri}, attempt {self.spawn_attempts[agent_name]}/{self.spawn_max_attempts})"
+            )
             future = self.spawn_client.call_async(request)
             future.add_done_callback(lambda fut, name=agent_name: self._spawn_done(name, fut))
 

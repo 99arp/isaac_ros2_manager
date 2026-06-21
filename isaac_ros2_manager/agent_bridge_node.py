@@ -125,7 +125,7 @@ class AgentBridge:
         self.odom_pub = self._publisher_if_needed(Odometry, self.odom_output_topic, self.isaac_odom_topics)
         self.odometry_pub = self._publisher_if_needed(Odometry, self.odometry_output_topic, self.isaac_odom_topics)
         self.odom_matcher_pub = self._publisher_if_needed(Odometry, self.odom_matcher_output_topic, self.isaac_odom_topics)
-        self.pose_pub = node.create_publisher(PoseStamped, self.pose_output_topic, 10)
+        self.pose_pub = self._publisher_if_needed(PoseStamped, self.pose_output_topic, self.isaac_pose_topics)
         self.gps_pub = node.create_publisher(NavSatFix, self.gps_output_topic, 10)
         self.is_flying_pub = node.create_publisher(Bool, self.is_flying_topic, 10)
         self.is_flying_snake_pub = node.create_publisher(Bool, self.is_flying_snake_topic, 10)
