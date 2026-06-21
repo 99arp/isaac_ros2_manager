@@ -344,10 +344,20 @@ class IsaacTeamManager(Node):
             backend.setdefault("px4_autolaunch", True)
             backend.setdefault("enable_lockstep", False)
             backend.setdefault("num_rotors", int(payload.pop("num_rotors", 4)))
+            if not backend.get("px4_dir"):
+                px4_dir = os.environ.get("PX4_DIR") or os.environ.get("PX4_AUTOPILOT_DIR")
+                default_px4_dir = "/home/qnc/Desktop/PX4-Autopilot"
+                if not px4_dir and os.path.isfile(os.path.join(default_px4_dir, "build", "px4_sitl_default", "bin", "px4")):
+                    px4_dir = default_px4_dir
+                if px4_dir:
+                    backend["px4_dir"] = px4_dir
             payload["px4_mavlink_backend"] = backend
         elif spec.kind == "ugv":
             payload.setdefault("control_mode", "ros2")
             payload.setdefault("drive_backend", "cmd_vel")
+            payload.setdefault("ros_namespace", namespace)
+            payload.setdefault("ros_topic_identifier", namespace)
+            payload.setdefault("cmd_vel_topic", join_name(namespace, "cmd_vel"))
 
         request.resource_string = json.dumps(payload)
         return request
