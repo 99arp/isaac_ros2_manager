@@ -69,6 +69,8 @@ class IsaacTeamManager(Node):
         self.declare_parameter("spawn_alt", 1.0)
         self.declare_parameter("odom_timeout_sec", 1.0)
         self.declare_parameter("synthetic_odom", True)
+        self.declare_parameter("spawn_confirm_timeout_sec", 30.0)
+        self.declare_parameter("spawn_max_attempts", 5)
 
         team_json = self._resolve_team_json(str(self.get_parameter("team_json").value))
         with open(team_json, "r", encoding="utf-8") as f:
@@ -89,13 +91,18 @@ class IsaacTeamManager(Node):
         self.origin_lon = float(self.get_parameter("origin_lon").value)
         self.origin_alt = float(self.get_parameter("origin_alt").value)
         self.spawn_alt = float(self.get_parameter("spawn_alt").value)
+        self.spawn_confirm_timeout_sec = float(self.get_parameter("spawn_confirm_timeout_sec").value)
+        self.spawn_max_attempts = int(self.get_parameter("spawn_max_attempts").value)
         self.has_geo_origin = self.origin_lat != 0.0 or self.origin_lon != 0.0
 
         self.spawn_requested = param_bool(self.get_parameter("spawn").value)
         self.spawn_with_isaac = param_bool(self.get_parameter("spawn_with_isaac").value)
         self.auto_update_db = param_bool(self.get_parameter("auto_update_db").value)
-        self.spawned_agents: set[str] = set()
+        self.spawned_agents: set[str] = set()       # /world_manager/add returned OK (accepted, not yet confirmed)
         self.pending_spawn_agents: set[str] = set()
+        self.confirmed_agents: set[str] = set()      # real Isaac odom seen -> entity is actually alive
+        self.spawn_attempts: dict[str, int] = {}
+        self.spawn_ack_monotonic: dict[str, float] = {}
 
         self.spawn_client = None
         if SpawnEntity is not None and self.spawn_with_isaac:
@@ -214,23 +221,72 @@ class IsaacTeamManager(Node):
         response.message = f"Spawn requested for team {self.team_name}; bridge topics are already active."
         return response
 
+    def _agent_confirmed(self, agent_name: str) -> bool:
+        """True once the agent is publishing real Isaac telemetry.
+
+        ``last_odom_monotonic`` only advances when the bridge receives an actual
+        Isaac odom/pose message (synthetic integration never touches it), so a
+        positive value means the spawned entity really exists in the sim -- a far
+        stronger signal than the fire-and-forget /world_manager/add OK response.
+        """
+        bridge = self.bridges.get(agent_name)
+        return bool(bridge is not None and getattr(bridge, "last_odom_monotonic", 0.0) > 0.0)
+
     def _spawn_missing_agents(self) -> None:
         if not self.spawn_with_isaac or self.spawn_client is None:
             return
-        if len(self.spawned_agents) == len(self.agents):
+
+        # Promote agents to "confirmed" once their telemetry is live.
+        for agent_name in self.agents:
+            if agent_name not in self.confirmed_agents and self._agent_confirmed(agent_name):
+                self.confirmed_agents.add(agent_name)
+                self.get_logger().info(f"Confirmed Isaac agent {self.team_name}/{agent_name} (odom active)")
+
+        if len(self.confirmed_agents) == len(self.agents):
             if self.spawn_retry_timer is not None:
                 self.spawn_retry_timer.cancel()
             return
+
         if not self.spawn_client.service_is_ready():
             self.get_logger().warning("Waiting for /world_manager/add to spawn missing team agents")
             return
+
+        now = time.monotonic()
         for index, (agent_name, agent) in enumerate(self.agents.items()):
-            if agent_name in self.spawned_agents or agent_name in self.pending_spawn_agents:
+            if agent_name in self.confirmed_agents or agent_name in self.pending_spawn_agents:
+                continue
+            # An accepted spawn that never produced telemetry within the confirm
+            # window almost certainly failed in the background (e.g. the scene was
+            # not ready). Drop the stale ack so it gets re-requested below.
+            if agent_name in self.spawned_agents:
+                if now - self.spawn_ack_monotonic.get(agent_name, now) < self.spawn_confirm_timeout_sec:
+                    continue
+                self.spawned_agents.discard(agent_name)
+                self.get_logger().warning(
+                    f"Isaac agent {self.team_name}/{agent_name} accepted but no odom after "
+                    f"{self.spawn_confirm_timeout_sec:.0f}s; re-requesting spawn"
+                )
+            if self.spawn_attempts.get(agent_name, 0) >= self.spawn_max_attempts:
                 continue
             request = self._spawn_request(index, agent_name, agent)
             self.pending_spawn_agents.add(agent_name)
+            self.spawn_attempts[agent_name] = self.spawn_attempts.get(agent_name, 0) + 1
             future = self.spawn_client.call_async(request)
             future.add_done_callback(lambda fut, name=agent_name: self._spawn_done(name, fut))
+
+        # Stop retrying only when every agent is either confirmed or has exhausted
+        # its attempts (and nothing is still in flight).
+        if not self.pending_spawn_agents and all(
+            name in self.confirmed_agents or self.spawn_attempts.get(name, 0) >= self.spawn_max_attempts
+            for name in self.agents
+        ):
+            if self.spawn_retry_timer is not None:
+                self.spawn_retry_timer.cancel()
+            unconfirmed = [n for n in self.agents if n not in self.confirmed_agents]
+            if unconfirmed:
+                self.get_logger().error(
+                    f"Giving up spawning Isaac agents after {self.spawn_max_attempts} attempts: {unconfirmed}"
+                )
 
     def _spawn_request(self, index: int, agent_name: str, agent: dict) -> "SpawnEntity.Request":
         x, y, z = self._agent_initial_pose(index, agent)
@@ -280,8 +336,14 @@ class IsaacTeamManager(Node):
             response = future.result()
             ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
             if ok:
+                # OK only means the request was accepted; the actual spawn runs
+                # asynchronously in the extension. Record the ack and wait for
+                # real odom (_agent_confirmed) before declaring success.
                 self.spawned_agents.add(agent_name)
-                self.get_logger().info(f"Spawned Isaac agent {self.team_name}/{agent_name}")
+                self.spawn_ack_monotonic[agent_name] = time.monotonic()
+                self.get_logger().info(
+                    f"Isaac spawn accepted for {self.team_name}/{agent_name}; awaiting odom confirmation"
+                )
             else:
                 self.get_logger().warning(
                     f"Isaac spawn failed for {self.team_name}/{agent_name}: {response.result.error_message}"
