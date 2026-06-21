@@ -72,6 +72,7 @@ class IsaacTeamManager(Node):
         self.declare_parameter("synthetic_odom", True)
         self.declare_parameter("spawn_confirm_timeout_sec", 30.0)
         self.declare_parameter("spawn_max_attempts", 5)
+        self.declare_parameter("spawn_retry_period_sec", 2.0)
 
         team_json = self._resolve_team_json(str(self.get_parameter("team_json").value))
         with open(team_json, "r", encoding="utf-8") as f:
@@ -94,6 +95,7 @@ class IsaacTeamManager(Node):
         self.spawn_alt = float(self.get_parameter("spawn_alt").value)
         self.spawn_confirm_timeout_sec = float(self.get_parameter("spawn_confirm_timeout_sec").value)
         self.spawn_max_attempts = int(self.get_parameter("spawn_max_attempts").value)
+        self.spawn_retry_period_sec = max(0.2, float(self.get_parameter("spawn_retry_period_sec").value))
         self.has_geo_origin = self.origin_lat != 0.0 or self.origin_lon != 0.0
 
         self.spawn_requested = param_bool(self.get_parameter("spawn").value)
@@ -142,7 +144,11 @@ class IsaacTeamManager(Node):
         )
 
         if self.spawn_requested:
-            self.spawn_retry_timer = self.create_timer(2.0, self._spawn_missing_agents, callback_group=self.cb_group)
+            self.spawn_retry_timer = self.create_timer(
+                self.spawn_retry_period_sec,
+                self._spawn_missing_agents,
+                callback_group=self.cb_group,
+            )
         else:
             self.spawn_retry_timer = None
         if self.db_client is not None:
@@ -230,10 +236,42 @@ class IsaacTeamManager(Node):
 
     def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.spawn_requested = True
+        reset_agents = self._reset_unconfirmed_spawn_state()
+        self._ensure_spawn_retry_timer()
         self._spawn_missing_agents()
         response.success = True
-        response.message = f"Spawn requested for team {self.team_name}; bridge topics are already active."
+        response.message = (
+            f"Spawn requested for team {self.team_name}; reset unconfirmed agents={reset_agents}; "
+            "bridge topics are already active."
+        )
         return response
+
+    def _reset_unconfirmed_spawn_state(self) -> list[str]:
+        reset_agents: list[str] = []
+        for agent_name in self.agents:
+            if self._agent_confirmed(agent_name):
+                self.confirmed_agents.add(agent_name)
+                continue
+            reset_agents.append(agent_name)
+            self.pending_spawn_agents.discard(agent_name)
+            self.spawned_agents.discard(agent_name)
+            self.spawn_attempts.pop(agent_name, None)
+            self.spawn_ack_monotonic.pop(agent_name, None)
+        if reset_agents:
+            self.get_logger().warning(
+                f"Resetting Isaac spawn retry state for unconfirmed agents: {reset_agents}"
+            )
+        return reset_agents
+
+    def _ensure_spawn_retry_timer(self) -> None:
+        if self.spawn_retry_timer is None:
+            self.spawn_retry_timer = self.create_timer(
+                self.spawn_retry_period_sec,
+                self._spawn_missing_agents,
+                callback_group=self.cb_group,
+            )
+            return
+        self.spawn_retry_timer.reset()
 
     def _agent_confirmed(self, agent_name: str) -> bool:
         """True once the agent is publishing real Isaac telemetry.
