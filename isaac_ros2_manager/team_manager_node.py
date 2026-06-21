@@ -95,6 +95,7 @@ class IsaacTeamManager(Node):
         self.spawn_with_isaac = param_bool(self.get_parameter("spawn_with_isaac").value)
         self.auto_update_db = param_bool(self.get_parameter("auto_update_db").value)
         self.spawned_agents: set[str] = set()
+        self.pending_spawn_agents: set[str] = set()
 
         self.spawn_client = None
         if SpawnEntity is not None and self.spawn_with_isaac:
@@ -224,9 +225,10 @@ class IsaacTeamManager(Node):
             self.get_logger().warning("Waiting for /world_manager/add to spawn missing team agents")
             return
         for index, (agent_name, agent) in enumerate(self.agents.items()):
-            if agent_name in self.spawned_agents:
+            if agent_name in self.spawned_agents or agent_name in self.pending_spawn_agents:
                 continue
             request = self._spawn_request(index, agent_name, agent)
+            self.pending_spawn_agents.add(agent_name)
             future = self.spawn_client.call_async(request)
             future.add_done_callback(lambda fut, name=agent_name: self._spawn_done(name, fut))
 
@@ -273,6 +275,7 @@ class IsaacTeamManager(Node):
         return request
 
     def _spawn_done(self, agent_name: str, future) -> None:
+        self.pending_spawn_agents.discard(agent_name)
         try:
             response = future.result()
             ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
