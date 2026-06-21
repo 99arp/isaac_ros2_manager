@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 
 import rclpy
@@ -131,6 +132,8 @@ class AgentBridge:
         self.last_cmd = Twist()
         self.last_cmd_monotonic = 0.0
         self.is_uav = str(config.kind).strip().lower() == "uav"
+        self._native_odom_origin = None
+        self._native_odom_origin_yaw = 0.0
         self.is_flying = False
         self.aero_platform_id = config.aero_platform_id or self._safe_aero_platform_id(self.agent_ns)
         self.aero_gps: NavSatFix | None = None
@@ -375,9 +378,10 @@ class AgentBridge:
         self._safe_publish(self.cmd_vel_pub, msg)
 
     def _odom_cb(self, msg: Odometry, source: str) -> None:
-        self.current_odom = msg
+        odom = self._rebase_isaac_odom(msg, source)
+        self.current_odom = odom
         self.last_odom_monotonic = time.monotonic()
-        self._publish_state(msg)
+        self._publish_state(odom)
 
     def _pose_cb(self, msg: PoseStamped, source: str) -> None:
         odom = Odometry()
@@ -388,6 +392,45 @@ class AgentBridge:
         self.current_odom = odom
         self.last_odom_monotonic = time.monotonic()
         self._publish_state(odom)
+
+    def _rebase_isaac_odom(self, msg: Odometry, source: str) -> Odometry:
+        """Convert Isaac Carter's local odom into the mission/world frame."""
+        if self.is_uav or source not in self.isaac_odom_topics:
+            return msg
+
+        if self._native_odom_origin is None:
+            self._native_odom_origin = deepcopy(msg.pose.pose.position)
+            self._native_odom_origin_yaw = yaw_from_quat(msg.pose.pose.orientation)
+            self.node.get_logger().info(
+                f"[isaac bridge] {self.agent_ns}: rebasing Isaac odom source {source} "
+                f"from local origin x={self._native_odom_origin.x:.3f}, "
+                f"y={self._native_odom_origin.y:.3f}, yaw={self._native_odom_origin_yaw:.3f} "
+                f"to spawn x={self.config.initial_x:.3f}, y={self.config.initial_y:.3f}, "
+                f"yaw={self.config.initial_yaw:.3f}"
+            )
+
+        native = msg.pose.pose.position
+        dx = float(native.x) - float(self._native_odom_origin.x)
+        dy = float(native.y) - float(self._native_odom_origin.y)
+        dz = float(native.z) - float(self._native_odom_origin.z)
+        origin_yaw = float(self.config.initial_yaw)
+        c = math.cos(origin_yaw)
+        s = math.sin(origin_yaw)
+
+        odom = deepcopy(msg)
+        odom.pose.pose.position.x = float(self.config.initial_x) + c * dx - s * dy
+        odom.pose.pose.position.y = float(self.config.initial_y) + s * dx + c * dy
+        odom.pose.pose.position.z = float(self.config.initial_z) + dz
+
+        native_yaw = yaw_from_quat(msg.pose.pose.orientation)
+        world_yaw = origin_yaw + self._normalize_angle(native_yaw - self._native_odom_origin_yaw)
+        set_quat_from_yaw(odom.pose.pose.orientation, world_yaw)
+
+        vx = float(msg.twist.twist.linear.x)
+        vy = float(msg.twist.twist.linear.y)
+        odom.twist.twist.linear.x = c * vx - s * vy
+        odom.twist.twist.linear.y = s * vx + c * vy
+        return odom
 
     def _timer_cb(self) -> None:
         if not rclpy.ok():
@@ -409,6 +452,10 @@ class AgentBridge:
         self.current_odom.pose.pose.position.y += math.sin(yaw) * speed * dt
         set_quat_from_yaw(self.current_odom.pose.pose.orientation, yaw)
         self.current_odom.twist.twist = self.last_cmd
+
+    @staticmethod
+    def _normalize_angle(value: float) -> float:
+        return math.atan2(math.sin(value), math.cos(value))
 
     def _publish_state(self, odom: Odometry) -> None:
         if not rclpy.ok():
