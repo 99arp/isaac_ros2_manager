@@ -30,6 +30,58 @@ def _resolve_team_json(team: str) -> str:
     raise FileNotFoundError(f"Cannot resolve team JSON: {team}")
 
 
+def _agent_kind(agent_dict: dict) -> str:
+    kind = str(agent_dict.get("kind") or "").strip().lower()
+    if kind:
+        return kind
+    manager = str(agent_dict.get("manager") or "").strip().lower()
+    if manager.startswith("uav_"):
+        return "uav"
+    if manager.startswith("ugv_"):
+        return "ugv"
+    agent_type = str(agent_dict.get("type") or "").strip().lower()
+    if "uav" in agent_type or "drone" in agent_type:
+        return "uav"
+    return "ugv"
+
+
+def _skill_manager_node(team_ns: str, agent_name: str, agent_dict: dict):
+    node_ns = f"/{team_ns}/{agent_name}"
+    kind = _agent_kind(agent_dict)
+    if kind == "uav":
+        return Node(
+            package="uav_ranger_manager",
+            executable="uav_ranger_manager_node",
+            namespace=node_ns,
+            output="screen",
+            remappings=[
+                ("~/odometry", f"{node_ns}/odometry"),
+                ("~/is_flying", f"{node_ns}/is_flying"),
+                ("navigate_to_pose", f"{node_ns}/navigate_to_pose"),
+                ("detect", f"{node_ns}/detect"),
+                ("disarm", f"{node_ns}/disarm"),
+                ("takeoff", f"{node_ns}/takeoff"),
+                ("land", f"{node_ns}/land"),
+            ],
+            parameters=[{"use_sim_time": True}],
+        )
+    if kind == "ugv":
+        return Node(
+            package="ugv_ranger_manager",
+            executable="ugv_ranger_manager_node",
+            namespace=node_ns,
+            output="screen",
+            remappings=[
+                ("~/odometry", f"{node_ns}/odom"),
+                ("navigate_to_pose", f"{node_ns}/navigate_to_pose"),
+                ("detect", f"{node_ns}/detect"),
+                ("disarm", f"{node_ns}/disarm"),
+            ],
+            parameters=[{"use_sim_time": True}],
+        )
+    raise ValueError(f"Unsupported Isaac skill manager kind for {agent_name}: {kind}")
+
+
 def _team_setup(context, *args, **kwargs):
     team_arg = LaunchConfiguration("team").perform(context)
     team_json = _resolve_team_json(team_arg)
@@ -38,7 +90,12 @@ def _team_setup(context, *args, **kwargs):
 
     team_ns = team_dict["name"]
     launch_agents = _as_bool(LaunchConfiguration("launch_agents").perform(context))
+    launch_skill_managers = _as_bool(LaunchConfiguration("launch_skill_managers").perform(context))
     actions = []
+
+    if launch_skill_managers:
+        for agent_name, agent_dict in team_dict.get("agents", {}).items():
+            actions.append(_skill_manager_node(team_ns, agent_name, agent_dict))
 
     if launch_agents:
         for agent_name, agent_dict in team_dict.get("agents", {}).items():
@@ -96,10 +153,11 @@ def generate_launch_description():
         DeclareLaunchArgument("team", default_value="None"),
         DeclareLaunchArgument("grid_size", default_value="1"),
         DeclareLaunchArgument("edge_size", default_value="250.0"),
-        DeclareLaunchArgument("world_offset", default_value="[]"),
+        DeclareLaunchArgument("world_offset", default_value="[0.0, 0.0]"),
         DeclareLaunchArgument("spawn", default_value="True"),
         DeclareLaunchArgument("spawn_with_isaac", default_value="True"),
-        DeclareLaunchArgument("launch_agents", default_value="True"),
+        DeclareLaunchArgument("launch_agents", default_value="False"),
+        DeclareLaunchArgument("launch_skill_managers", default_value="True"),
         DeclareLaunchArgument("auto_update_db", default_value="True"),
         DeclareLaunchArgument("synthetic_odom", default_value="True"),
         DeclareLaunchArgument("odom_timeout_sec", default_value="1.0"),

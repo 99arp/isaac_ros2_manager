@@ -28,6 +28,7 @@ setup(
             "isaac_agent_bridge_node = isaac_ros2_manager.agent_bridge_node:main",
             "isaac_env_manager_node = isaac_ros2_manager.env_manager_node:main",
             "isaac_team_manager_node = isaac_ros2_manager.team_manager_node:main",
+            "isaac_yolo_detection_adapter_node = isaac_ros2_manager.yolo_detection_adapter_node:main",
         ],
     },
 )

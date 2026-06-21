@@ -220,7 +220,7 @@ class IsaacTeamManager(Node):
             if self.spawn_retry_timer is not None:
                 self.spawn_retry_timer.cancel()
             return
-        if not self.spawn_client.service_is_ready() and not self.spawn_client.wait_for_service(timeout_sec=0.01):
+        if not self.spawn_client.service_is_ready():
             self.get_logger().warning("Waiting for /world_manager/add to spawn missing team agents")
             return
         for index, (agent_name, agent) in enumerate(self.agents.items()):

@@ -26,6 +26,12 @@ try:
 except Exception:
     auspex_compat = None
 
+try:
+    from simulation_interfaces.srv import DeleteEntity, SpawnEntity
+except Exception:
+    DeleteEntity = None
+    SpawnEntity = None
+
 
 class IsaacEnvironmentManager(Node):
     """Isaac-side stand-in for the Webots env_manager: areas, objectives, map, clock."""
@@ -45,6 +51,9 @@ class IsaacEnvironmentManager(Node):
         self.declare_parameter("publish_clock", True)
         self.declare_parameter("map_rate_hz", 0.2)
         self.declare_parameter("clock_rate_hz", 20.0)
+        self.declare_parameter("spawn_with_isaac", True)
+        self.declare_parameter("objective_model", "bear_trap")
+        self.declare_parameter("objective_z_offset", 0.0)
 
         self.grid_size = int(self.get_parameter("grid_size").value)
         self.edge_size = float(self.get_parameter("edge_size").value)
@@ -52,10 +61,17 @@ class IsaacEnvironmentManager(Node):
         self.ground_z = float(self.get_parameter("ground_z").value)
         self.auto_update_db = param_bool(self.get_parameter("auto_update_db").value)
         self.publish_clock = param_bool(self.get_parameter("publish_clock").value)
+        self.spawn_with_isaac = param_bool(self.get_parameter("spawn_with_isaac").value)
+        self.objective_model = str(self.get_parameter("objective_model").value)
+        self.objective_z_offset = float(self.get_parameter("objective_z_offset").value)
         self.mission = MissionModel.build(self.grid_size, self.edge_size, self.world_offset)
         self.objectives: dict[str, Objective] = {}
         self.teams: set[str] = set()
         self.start_time = time.monotonic()
+        self.spawned_objective_entities: set[str] = set()
+        self.pending_spawn_objective_entities: set[str] = set()
+        self.pending_delete_objective_entities: set[str] = set()
+        self.removed_objective_entities: set[str] = set()
 
         if param_bool(self.get_parameter("spawn_objectives").value):
             self._create_default_objectives()
@@ -63,6 +79,15 @@ class IsaacEnvironmentManager(Node):
         self.db_client = None
         if auspex_compat is not None and self.auto_update_db:
             self.db_client = auspex_compat.make_write_client(self)
+
+        self.spawn_client = None
+        self.delete_client = None
+        if self.spawn_with_isaac and SpawnEntity is not None:
+            self.spawn_client = self.create_client(SpawnEntity, "/world_manager/add", callback_group=self.cb_group)
+        if self.spawn_with_isaac and DeleteEntity is not None:
+            self.delete_client = self.create_client(DeleteEntity, "/world_manager/remove", callback_group=self.cb_group)
+        if self.spawn_with_isaac and (self.spawn_client is None or self.delete_client is None):
+            self.get_logger().warning("simulation_interfaces world-manager services unavailable; objective USD sync disabled")
 
         self.create_service(SendString, "~/add_controller", self._add_controller_cb, callback_group=self.cb_group)
         self.create_service(Trigger, "~/grid_size", self._grid_size_cb, callback_group=self.cb_group)
@@ -87,6 +112,8 @@ class IsaacEnvironmentManager(Node):
             self.create_timer(1.0 / clock_rate, self._publish_clock, callback_group=self.cb_group)
         if self.db_client is not None:
             self.create_timer(3.0, self._update_db, callback_group=self.cb_group)
+        if self.spawn_with_isaac and self.spawn_client is not None:
+            self.create_timer(2.0, self._sync_isaac_objectives, callback_group=self.cb_group)
 
         self._publish_map()
         self._update_db()
@@ -162,6 +189,7 @@ class IsaacEnvironmentManager(Node):
         response.status = obj.status
         response.type = obj.type
         self._update_db()
+        self._sync_isaac_objectives()
         return response
 
     def _get_objective_type_cb(self, request: ObjectiveService.Request, response: ObjectiveService.Response) -> ObjectiveService.Response:
@@ -214,17 +242,118 @@ class IsaacEnvironmentManager(Node):
         response.success = True
         response.message = f"Spawned traps in {area.area_id}"
         self._update_db()
+        self._sync_isaac_objectives()
         return response
 
     def _remove_traps_cb(self, request: SendString.Request, response: SendString.Response) -> SendString.Response:
         prefix = request.data + "_objective_"
         for name in list(self.objectives):
             if name.startswith(prefix):
+                self.removed_objective_entities.add(name)
+                self._delete_objective_entity(name)
                 del self.objectives[name]
         response.success = True
         response.message = f"Removed traps in {request.data}"
         self._update_db()
         return response
+
+    def _sync_isaac_objectives(self) -> None:
+        if not self.spawn_with_isaac:
+            return
+        for name in list(self.removed_objective_entities):
+            if name not in self.pending_delete_objective_entities:
+                self._delete_objective_entity(name)
+        for name in list(self.spawned_objective_entities):
+            if name not in self.objectives and name not in self.pending_delete_objective_entities:
+                self.removed_objective_entities.add(name)
+                self._delete_objective_entity(name)
+        for obj in self.objectives.values():
+            if (
+                obj.status == Objective.ACTIVE
+                and obj.name not in self.spawned_objective_entities
+                and obj.name not in self.pending_spawn_objective_entities
+            ):
+                self._spawn_objective_entity(obj)
+            elif (
+                obj.status != Objective.ACTIVE
+                and obj.name in self.spawned_objective_entities
+                and obj.name not in self.pending_delete_objective_entities
+            ):
+                self._delete_objective_entity(obj.name)
+
+    def _spawn_objective_entity(self, obj: Objective) -> None:
+        if self.spawn_client is None:
+            return
+        if not self.spawn_client.service_is_ready():
+            return
+
+        self.pending_spawn_objective_entities.add(obj.name)
+        request = SpawnEntity.Request()
+        request.name = obj.name
+        request.uri = "object"
+        request.entity_namespace = obj.name
+        request.allow_renaming = False
+        request.initial_pose.header.frame_id = "map"
+        request.initial_pose.pose.position.x = float(obj.position.x)
+        request.initial_pose.pose.position.y = float(obj.position.y)
+        request.initial_pose.pose.position.z = float(self.ground_z + self.objective_z_offset)
+        request.initial_pose.pose.orientation.w = 1.0
+        request.resource_string = json.dumps({
+            "model": self.objective_model,
+            "stage_prefix": obj.name,
+            "init_pos": [
+                float(obj.position.x),
+                float(obj.position.y),
+                float(self.ground_z + self.objective_z_offset),
+            ],
+            "snap_to_terrain": True,
+            "publish_pose_ros": True,
+            "ros_topic_identifier": obj.name,
+            "pose_frame_id": "map",
+        })
+        future = self.spawn_client.call_async(request)
+        future.add_done_callback(lambda fut, name=obj.name: self._spawn_objective_done(name, fut))
+
+    def _spawn_objective_done(self, name: str, future) -> None:
+        self.pending_spawn_objective_entities.discard(name)
+        try:
+            response = future.result()
+            ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
+            if ok:
+                self.spawned_objective_entities.add(name)
+                self.get_logger().info(f"Spawned Isaac objective {name}")
+            else:
+                self.get_logger().warning(f"Isaac objective spawn failed for {name}: {response.result.error_message}")
+        except Exception as exc:
+            self.get_logger().warning(f"Isaac objective spawn call failed for {name}: {exc}")
+
+    def _delete_objective_entity(self, name: str) -> None:
+        if self.delete_client is None:
+            self.spawned_objective_entities.discard(name)
+            self.removed_objective_entities.discard(name)
+            return
+        if not self.delete_client.service_is_ready():
+            return
+
+        self.pending_delete_objective_entities.add(name)
+        request = DeleteEntity.Request()
+        request.entity = name
+        future = self.delete_client.call_async(request)
+        future.add_done_callback(lambda fut, entity=name: self._delete_objective_done(entity, fut))
+
+    def _delete_objective_done(self, name: str, future) -> None:
+        self.pending_delete_objective_entities.discard(name)
+        try:
+            response = future.result()
+            ok = getattr(response.result, "result", 0) == response.result.RESULT_OK
+            if ok:
+                self.spawned_objective_entities.discard(name)
+                self.removed_objective_entities.discard(name)
+                self.get_logger().info(f"Removed Isaac objective {name}")
+            else:
+                self.get_logger().warning(f"Isaac objective remove failed for {name}: {response.result.error_message}")
+        except Exception as exc:
+            self.get_logger().warning(f"Isaac objective remove call failed for {name}: {exc}")
 
     def _publish_map(self) -> None:
         msg = OccupancyGrid()
