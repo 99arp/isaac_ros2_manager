@@ -58,6 +58,8 @@ class IsaacObjectiveStateNode(Node):
         self.declare_parameter("area_objectives_topic", "/auspex_know/knowledge_collector/area_objectives")
         self.declare_parameter("team_data_topic", "/auspex_know/knowledge_collector/team_data")
         self.declare_parameter("area_data_topic", "/auspex_know/knowledge_collector/area_data")
+        self.declare_parameter("publish_team_data", True)
+        self.declare_parameter("publish_area_data", True)
         self.declare_parameter("direct_know_write", True)
         self.declare_parameter("area_size", [250.0, 250.0])
         self.declare_parameter("area_offset", [-125.0, -125.0])
@@ -93,6 +95,8 @@ class IsaacObjectiveStateNode(Node):
         )
         self.team_data_pub = self.create_publisher(StringKnowledge, team_data_topic, 10)
         self.area_data_pub = self.create_publisher(StringKnowledge, area_data_topic, 10)
+        self.publish_team_data = bool(self.get_parameter("publish_team_data").value)
+        self.publish_area_data = bool(self.get_parameter("publish_area_data").value)
         self.direct_know_write = bool(self.get_parameter("direct_know_write").value)
         self.know_upsert_client = self.create_client(UpsertSubframe, "/auspex_know/upsert_subframe")
         self._know_upsert_unavailable_logged = False
@@ -135,6 +139,7 @@ class IsaacObjectiveStateNode(Node):
             "Isaac objective state ready: "
             f"detections={detected_topic}; area_objectives={area_objectives_topic}; "
             f"team_data={team_data_topic}; area_data={area_data_topic}; "
+            f"publish_team_data={self.publish_team_data}; publish_area_data={self.publish_area_data}; "
             f"objectives={len(self.records)}; agents={self._action_agents()}"
         )
 
@@ -411,8 +416,10 @@ class IsaacObjectiveStateNode(Node):
 
     def _publish_knowledge(self) -> None:
         self._publish_area_objectives()
-        self._publish_team_data()
-        self._publish_area_data()
+        if self.publish_team_data:
+            self._publish_team_data()
+        if self.publish_area_data:
+            self._publish_area_data()
 
     def _publish_team_data(self) -> None:
         msg = StringKnowledge()

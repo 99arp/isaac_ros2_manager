@@ -28,6 +28,7 @@ setup(
             "isaac_startup_ready_node = isaac_ros2_manager.startup_ready_node:main",
             "isaac_yolo_detection_adapter_node = isaac_ros2_manager.yolo_detection_adapter_node:main",
             "isaac_objective_state_node = isaac_ros2_manager.objective_state_node:main",
+            "isaac_team_manager_node = isaac_ros2_manager.team_manager_node:main",
         ],
     },
 )

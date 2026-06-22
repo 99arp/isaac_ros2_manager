@@ -24,20 +24,21 @@ per-agent `detect`/`disarm` actions used by the skill managers.
 |---|---|
 | `isaac_startup_ready_node` | Passive startup reporter. It republishes `/world_manager/ready` as `/isaac_integration/ready`; it does not create map, objectives, clock, or KNOW data. |
 | `isaac_objective_state_node` | Loads configured static objectives, publishes `/auspex_know/knowledge_collector/area_objectives`, consumes `/<team>/team_manager/detected_objectives`, and serves `/<team>/<agent>/{detect,disarm}`. |
+| `isaac_team_manager_node` | Webots-compatible team facade for Isaac. It publishes team/area KNOW state and exposes `/<team>/move_to_area` / `/<team>/sweep_area`, forwarding movement to `/<team>/ample/execute_plan`. |
 | `isaac_yolo_detection_adapter_node` | Converts Isaac camera detections into the existing trap-detection pose topic. |
 
-`isaac_team.launch.py` starts the objective-state node and the existing UAV/UGV
-skill managers. For UAVs it also starts the AUSPEX-AERO platform adapter that
-backs `takeoff`, `land`, and `navigate_to_pose`. It does not start an Isaac team
-manager and does not spawn agents.
+`isaac_team.launch.py` starts the objective-state node, the Isaac team manager,
+and the existing UAV/UGV skill managers. For UAVs it also starts the AUSPEX-AERO
+platform adapter that backs `takeoff`, `land`, and `navigate_to_pose`. It does
+not spawn agents.
 
 ## Removed
 
-The previous `AgentBridge` and `isaac_team_manager_node` path has been removed.
-There is no `/world_manager/add` fallback for agents and no synthetic odometry
-bridge. If a required endpoint is missing, fix the component that owns that
-endpoint: Isaac for static scene/sensors, AUSPEX-AERO or another platform
-adapter for flight control, and KNOW/mission publishers for area/objective state.
+The previous synthetic `AgentBridge` path has been removed. There is no
+`/world_manager/add` fallback for agents and no synthetic odometry bridge. If a
+required endpoint is missing, fix the component that owns that endpoint: Isaac
+for static scene/sensors, AUSPEX-AERO or another platform adapter for flight
+control, and KNOW/mission publishers for area/objective state.
 
 ## Expected Isaac Contract
 
