@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -38,9 +39,17 @@ except Exception:
     auspex_compat = None
 
 try:
-    from simulation_interfaces.srv import SpawnEntity
+    from simulation_interfaces.srv import DeleteEntity, SpawnEntity
 except Exception:
+    DeleteEntity = None
     SpawnEntity = None
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 class IsaacTeamManager(Node):
@@ -73,7 +82,14 @@ class IsaacTeamManager(Node):
         self.declare_parameter("spawn_confirm_timeout_sec", 180.0)
         self.declare_parameter("spawn_max_attempts", 0)
         self.declare_parameter("spawn_retry_period_sec", 2.0)
-        self.declare_parameter("spawn_call_timeout_sec", 10.0)
+        self.declare_parameter("spawn_call_timeout_sec", 180.0)
+        self.declare_parameter("spawn_telemetry_stale_timeout_sec", 10.0)
+        self.declare_parameter("spawn_confirm_settle_sec", 8.0)
+        self.declare_parameter("spawn_motion_probe_enabled", True)
+        self.declare_parameter("spawn_motion_probe_duration_sec", 3.0)
+        self.declare_parameter("spawn_motion_probe_linear_x", 0.35)
+        self.declare_parameter("spawn_motion_probe_min_delta_m", 0.05)
+        self.declare_parameter("uav_vehicle_id_base", env_int("AERO_VEHICLE_ID", 0))
 
         team_json = self._resolve_team_json(str(self.get_parameter("team_json").value))
         with open(team_json, "r", encoding="utf-8") as f:
@@ -81,6 +97,7 @@ class IsaacTeamManager(Node):
         self.team_json = team_json
         self.team_name = self.team_dict["name"]
         self.agents = self.team_dict.get("agents", {})
+        self.uav_vehicle_id_base = max(0, int(self.get_parameter("uav_vehicle_id_base").value))
         self.uav_vehicle_ids = self._build_uav_vehicle_ids()
 
         self.grid_size = int(self.get_parameter("grid_size").value)
@@ -99,6 +116,24 @@ class IsaacTeamManager(Node):
         self.spawn_max_attempts = max(0, int(self.get_parameter("spawn_max_attempts").value))
         self.spawn_retry_period_sec = max(0.2, float(self.get_parameter("spawn_retry_period_sec").value))
         self.spawn_call_timeout_sec = max(1.0, float(self.get_parameter("spawn_call_timeout_sec").value))
+        self.spawn_telemetry_stale_timeout_sec = max(
+            1.0,
+            float(self.get_parameter("spawn_telemetry_stale_timeout_sec").value),
+        )
+        self.spawn_confirm_settle_sec = max(0.0, float(self.get_parameter("spawn_confirm_settle_sec").value))
+        self.spawn_motion_probe_enabled = param_bool(self.get_parameter("spawn_motion_probe_enabled").value)
+        self.spawn_motion_probe_duration_sec = max(
+            0.2,
+            float(self.get_parameter("spawn_motion_probe_duration_sec").value),
+        )
+        self.spawn_motion_probe_linear_x = max(
+            0.05,
+            float(self.get_parameter("spawn_motion_probe_linear_x").value),
+        )
+        self.spawn_motion_probe_min_delta_m = max(
+            0.0,
+            float(self.get_parameter("spawn_motion_probe_min_delta_m").value),
+        )
         self.has_geo_origin = self.origin_lat != 0.0 or self.origin_lon != 0.0
 
         self.spawn_requested = param_bool(self.get_parameter("spawn").value)
@@ -110,14 +145,34 @@ class IsaacTeamManager(Node):
         self.spawn_attempts: dict[str, int] = {}
         self.spawn_ack_monotonic: dict[str, float] = {}
         self.spawn_call_monotonic: dict[str, float] = {}
+        self.spawn_first_telemetry_monotonic: dict[str, float] = {}
+        self.spawn_motion_probed_agents: set[str] = set()
+        self.spawn_motion_probe_active_agents: set[str] = set()
+        self.spawn_retry_not_before_monotonic: dict[str, float] = {}
         self.last_spawn_wait_log_monotonic = 0.0
         self.agent_spawn_wait_log_monotonic: dict[str, float] = {}
 
         self.spawn_client = None
+        self.remove_client = None
         if SpawnEntity is not None and self.spawn_with_isaac:
             self.spawn_client = self.create_client(SpawnEntity, "/world_manager/add", callback_group=self.cb_group)
+            if DeleteEntity is not None:
+                self.remove_client = self.create_client(
+                    DeleteEntity,
+                    "/world_manager/remove",
+                    callback_group=self.cb_group,
+                )
         elif self.spawn_with_isaac:
             self.get_logger().warning("simulation_interfaces/srv/SpawnEntity is unavailable; using bridge-only mode")
+        if (
+            self.spawn_with_isaac
+            and self.spawn_motion_probe_enabled
+            and self.remove_client is None
+            and DeleteEntity is None
+        ):
+            self.get_logger().warning(
+                "simulation_interfaces/srv/DeleteEntity is unavailable; Carter motion probe cannot remove bad spawns"
+            )
 
         self.db_client = None
         if auspex_compat is not None and self.auto_update_db:
@@ -162,7 +217,8 @@ class IsaacTeamManager(Node):
 
         self.get_logger().info(
             f"Isaac team_manager ready for team '{self.team_name}' with agents={list(self.agents.keys())};"
-            f" spawn_with_isaac={self.spawn_with_isaac}; geo_origin={self.has_geo_origin}"
+            f" spawn_with_isaac={self.spawn_with_isaac}; geo_origin={self.has_geo_origin};"
+            f" uav_vehicle_ids={self.uav_vehicle_ids}"
         )
 
     def _resolve_team_json(self, value: str) -> str:
@@ -213,7 +269,7 @@ class IsaacTeamManager(Node):
             config = AgentBridgeConfig(
                 agent_namespace=ns,
                 kind=kind,
-                isaac_cmd_vel_topic="/cmd_vel" if kind == "ugv" else join_name(ns, "cmd_vel"),
+                isaac_cmd_vel_topic=join_name(ns, "cmd_vel"),
                 isaac_odom_topics=odom_topics,
                 isaac_pose_topics=pose_topics,
                 set_target_topic=join_name(ns, "set_target"),
@@ -244,7 +300,7 @@ class IsaacTeamManager(Node):
         vehicle_ids: dict[str, int] = {}
         for agent_name, agent in self.agents.items():
             if resolve_proto(agent).kind == "uav":
-                vehicle_ids[agent_name] = len(vehicle_ids)
+                vehicle_ids[agent_name] = self.uav_vehicle_id_base + len(vehicle_ids)
         return vehicle_ids
 
     def _spawn_team_cb(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
@@ -265,7 +321,7 @@ class IsaacTeamManager(Node):
         waiting_agents: list[str] = []
         now = time.monotonic()
         for agent_name in self.agents:
-            if self._agent_confirmed(agent_name):
+            if self._agent_confirmed(agent_name, now=now) and self._agent_motion_confirmed(agent_name):
                 self.confirmed_agents.add(agent_name)
                 continue
 
@@ -284,12 +340,7 @@ class IsaacTeamManager(Node):
                 continue
 
             reset_agents.append(agent_name)
-            self.pending_spawn_agents.discard(agent_name)
-            self.spawned_agents.discard(agent_name)
-            self.spawn_attempts.pop(agent_name, None)
-            self.spawn_ack_monotonic.pop(agent_name, None)
-            self.spawn_call_monotonic.pop(agent_name, None)
-            self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
+            self._clear_agent_spawn_tracking(agent_name, clear_attempts=True)
         if reset_agents:
             self.get_logger().warning(
                 f"Resetting stale Isaac spawn retry state for unconfirmed agents: {reset_agents}"
@@ -310,34 +361,224 @@ class IsaacTeamManager(Node):
             return
         self.spawn_retry_timer.reset()
 
-    def _agent_confirmed(self, agent_name: str) -> bool:
+    def _clear_agent_spawn_tracking(
+        self,
+        agent_name: str,
+        *,
+        clear_attempts: bool = False,
+        clear_retry_delay: bool = True,
+        clear_bridge_telemetry: bool = True,
+    ) -> None:
+        self.confirmed_agents.discard(agent_name)
+        self.pending_spawn_agents.discard(agent_name)
+        self.spawned_agents.discard(agent_name)
+        if clear_attempts:
+            self.spawn_attempts.pop(agent_name, None)
+        self.spawn_ack_monotonic.pop(agent_name, None)
+        self.spawn_call_monotonic.pop(agent_name, None)
+        self.spawn_first_telemetry_monotonic.pop(agent_name, None)
+        self.spawn_motion_probed_agents.discard(agent_name)
+        self.spawn_motion_probe_active_agents.discard(agent_name)
+        if clear_retry_delay:
+            self.spawn_retry_not_before_monotonic.pop(agent_name, None)
+        self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
+
+        if not clear_bridge_telemetry:
+            return
+        bridge = self.bridges.get(agent_name)
+        if bridge is None:
+            return
+        try:
+            bridge.last_odom_monotonic = 0.0
+            bridge._native_odom_origin = None
+        except Exception:
+            pass
+
+    def _agent_confirmed(self, agent_name: str, *, now: float | None = None) -> bool:
         """True once the agent is publishing real Isaac telemetry.
 
         ``last_odom_monotonic`` only advances when the bridge receives an actual
         Isaac odom/pose message (synthetic integration never touches it), so a
-        positive value means the spawned entity really exists in the sim -- a far
-        stronger signal than the fire-and-forget /world_manager/add OK response.
+        recent positive value means the spawned entity really exists in the sim
+        -- a far stronger signal than the fire-and-forget /world_manager/add OK
+        response. The freshness check lets the manager recover after Isaac Sim is
+        restarted while this ROS launch keeps running.
         """
         bridge = self.bridges.get(agent_name)
-        return bool(bridge is not None and getattr(bridge, "last_odom_monotonic", 0.0) > 0.0)
+        last_odom = float(getattr(bridge, "last_odom_monotonic", 0.0) if bridge is not None else 0.0)
+        if last_odom <= 0.0:
+            self.spawn_first_telemetry_monotonic.pop(agent_name, None)
+            return False
+        if now is None:
+            now = time.monotonic()
+        if now - last_odom > self.spawn_telemetry_stale_timeout_sec:
+            self.spawn_first_telemetry_monotonic.pop(agent_name, None)
+            return False
+        if agent_name in self.confirmed_agents:
+            return True
+        first_telemetry = self.spawn_first_telemetry_monotonic.setdefault(agent_name, last_odom)
+        return now - first_telemetry >= self.spawn_confirm_settle_sec
+
+    def _agent_motion_confirmed(self, agent_name: str) -> bool:
+        if not self._requires_motion_probe(agent_name):
+            return True
+        if agent_name in self.spawn_motion_probed_agents:
+            return True
+        if agent_name in self.spawn_motion_probe_active_agents:
+            self._log_agent_spawn_wait(
+                agent_name,
+                time.monotonic(),
+                f"Waiting for Carter drive probe to finish for {self.team_name}/{agent_name}",
+            )
+            return False
+        return self._probe_carter_motion(agent_name)
+
+    def _requires_motion_probe(self, agent_name: str) -> bool:
+        if not self.spawn_motion_probe_enabled:
+            return False
+        agent = self.agents.get(agent_name, {})
+        spec = resolve_proto(agent)
+        return spec.kind == "ugv" and spec.uri == "carter"
+
+    def _probe_carter_motion(self, agent_name: str) -> bool:
+        bridge = self.bridges.get(agent_name)
+        if bridge is None or getattr(bridge, "cmd_vel_pub", None) is None:
+            self.get_logger().warning(
+                f"Skipping Carter motion probe for {self.team_name}/{agent_name}; bridge publisher unavailable"
+            )
+            return True
+
+        start = bridge.current_odom.pose.pose.position
+        start_x = float(start.x)
+        start_y = float(start.y)
+        probe_twist = Twist()
+        probe_twist.linear.x = self.spawn_motion_probe_linear_x
+        duration = self.spawn_motion_probe_duration_sec
+
+        self.spawn_motion_probe_active_agents.add(agent_name)
+        try:
+            self.get_logger().info(
+                f"Validating Carter drive for {self.team_name}/{agent_name}: "
+                f"{duration:.1f}s cmd_vel probe at {self.spawn_motion_probe_linear_x:.2f} m/s"
+            )
+            deadline = time.monotonic() + duration
+            while rclpy.ok() and time.monotonic() < deadline:
+                bridge._publish_cmd_vel(probe_twist)
+                time.sleep(0.05)
+            bridge._publish_cmd_vel(Twist())
+            time.sleep(0.2)
+        except Exception:
+            self.spawn_motion_probe_active_agents.discard(agent_name)
+            raise
+
+        end = bridge.current_odom.pose.pose.position
+        delta_xy = math.hypot(float(end.x) - start_x, float(end.y) - start_y)
+        if delta_xy >= self.spawn_motion_probe_min_delta_m:
+            self.spawn_motion_probed_agents.add(agent_name)
+            self.spawn_motion_probe_active_agents.discard(agent_name)
+            self.get_logger().info(
+                f"Carter drive validated for {self.team_name}/{agent_name}: "
+                f"delta_xy={delta_xy:.3f}m"
+            )
+            return True
+
+        self.get_logger().warning(
+            f"Carter drive probe failed for {self.team_name}/{agent_name}: "
+            f"delta_xy={delta_xy:.3f}m < {self.spawn_motion_probe_min_delta_m:.3f}m; "
+            "removing bad spawn and retrying"
+        )
+        self._remove_isaac_agent(agent_name)
+        self._clear_agent_spawn_tracking(
+            agent_name,
+            clear_attempts=False,
+            clear_retry_delay=False,
+            clear_bridge_telemetry=True,
+        )
+        self.spawn_retry_not_before_monotonic[agent_name] = (
+            time.monotonic() + max(1.0, self.spawn_retry_period_sec)
+        )
+        return False
+
+    def _remove_isaac_agent(self, agent_name: str) -> bool:
+        if self.remove_client is None or DeleteEntity is None:
+            self.get_logger().warning(
+                f"Cannot remove bad Isaac spawn for {self.team_name}/{agent_name}; "
+                "/world_manager/remove is unavailable"
+            )
+            return False
+        if not self.remove_client.service_is_ready():
+            try:
+                self.remove_client.wait_for_service(timeout_sec=1.0)
+            except Exception:
+                pass
+        if not self.remove_client.service_is_ready():
+            self.get_logger().warning(
+                f"Cannot remove bad Isaac spawn for {self.team_name}/{agent_name}; "
+                "/world_manager/remove is not ready"
+            )
+            return False
+
+        request = DeleteEntity.Request()
+        request.entity = f"{self.team_name}_{agent_name}"
+        response, error = self._wait_future(
+            self.remove_client.call_async(request),
+            timeout_sec=max(2.0, self.spawn_retry_period_sec),
+        )
+        if response is None:
+            self.get_logger().warning(
+                f"Delete request for {self.team_name}/{agent_name} did not complete: {error}"
+            )
+            return False
+
+        result = getattr(response, "result", None)
+        code = int(getattr(result, "result", 0))
+        ok_code = int(getattr(result, "RESULT_OK", 1))
+        if code == ok_code:
+            self.get_logger().info(f"Delete accepted for bad Isaac spawn {self.team_name}/{agent_name}")
+            return True
+
+        self.get_logger().warning(
+            f"Delete request failed for bad Isaac spawn {self.team_name}/{agent_name}: "
+            f"{getattr(result, 'error_message', '')}"
+        )
+        return False
 
     def _spawn_missing_agents(self) -> None:
         if not self.spawn_with_isaac or self.spawn_client is None:
             return
 
+        now = time.monotonic()
+        self._drop_stale_confirmed_agents(now)
+
         # Promote agents to "confirmed" once their telemetry is live.
         for agent_name in self.agents:
-            if agent_name not in self.confirmed_agents and self._agent_confirmed(agent_name):
+            if (
+                agent_name not in self.confirmed_agents
+                and self._agent_confirmed(agent_name, now=now)
+                and self._agent_motion_confirmed(agent_name)
+            ):
                 self.confirmed_agents.add(agent_name)
                 self.agent_spawn_wait_log_monotonic.pop(agent_name, None)
-                self.get_logger().info(f"Confirmed Isaac agent {self.team_name}/{agent_name} (odom active)")
+                self.spawn_retry_not_before_monotonic.pop(agent_name, None)
+                self.get_logger().info(
+                    f"Confirmed Isaac agent {self.team_name}/{agent_name} (odom and drive active)"
+                )
+            elif agent_name not in self.confirmed_agents and agent_name in self.spawn_first_telemetry_monotonic:
+                first_telemetry = self.spawn_first_telemetry_monotonic[agent_name]
+                self._log_agent_spawn_wait(
+                    agent_name,
+                    now,
+                    f"Waiting for {self._agent_kind_label(agent_name)} telemetry to settle for "
+                    f"{self.team_name}/{agent_name}; "
+                    f"{now - first_telemetry:.0f}/{self.spawn_confirm_settle_sec:.0f}s after first odom",
+                )
 
         if len(self.confirmed_agents) == len(self.agents):
-            if self.spawn_retry_timer is not None:
-                self.spawn_retry_timer.cancel()
+            # Keep the timer alive after initial success. If Isaac Sim is
+            # restarted while the rest of the stack stays up, the next timer tick
+            # will notice stale telemetry and re-request the missing entity.
             return
 
-        now = time.monotonic()
         self._clear_stale_pending_spawn_calls(now)
 
         if not self.spawn_client.service_is_ready():
@@ -368,6 +609,18 @@ class IsaacTeamManager(Node):
                     f"{self.team_name}/{agent_name}; request in flight for {now - started:.0f}s",
                 )
                 continue
+            retry_not_before = self.spawn_retry_not_before_monotonic.get(agent_name)
+            if retry_not_before is not None:
+                if now < retry_not_before:
+                    self._log_agent_spawn_wait(
+                        agent_name,
+                        now,
+                        f"Waiting to retry {self._agent_kind_label(agent_name)} spawn for "
+                        f"{self.team_name}/{agent_name}; delete is settling for "
+                        f"{retry_not_before - now:.1f}s",
+                    )
+                    continue
+                self.spawn_retry_not_before_monotonic.pop(agent_name, None)
             # An accepted spawn that never produced telemetry within the confirm
             # window almost certainly failed in the background (e.g. the scene was
             # not ready). Drop the stale ack so it gets re-requested below.
@@ -399,6 +652,8 @@ class IsaacTeamManager(Node):
             request = self._spawn_request(index, agent_name, agent)
             self.pending_spawn_agents.add(agent_name)
             self.spawn_call_monotonic[agent_name] = now
+            self.spawn_first_telemetry_monotonic.pop(agent_name, None)
+            self.spawn_motion_probed_agents.discard(agent_name)
             self.spawn_attempts[agent_name] = self.spawn_attempts.get(agent_name, 0) + 1
             self.get_logger().info(
                 f"Requesting Isaac spawn for {self.team_name}/{agent_name} "
@@ -421,6 +676,22 @@ class IsaacTeamManager(Node):
                 self.get_logger().error(
                     f"Giving up spawning Isaac agents after {self.spawn_max_attempts} attempts: {unconfirmed}"
                 )
+
+    def _drop_stale_confirmed_agents(self, now: float) -> None:
+        stale_agents = [
+            agent_name
+            for agent_name in list(self.confirmed_agents)
+            if not self._agent_confirmed(agent_name, now=now)
+        ]
+        for agent_name in stale_agents:
+            bridge = self.bridges.get(agent_name)
+            last_odom = float(getattr(bridge, "last_odom_monotonic", 0.0) if bridge is not None else 0.0)
+            age = now - last_odom if last_odom > 0.0 else float("inf")
+            self._clear_agent_spawn_tracking(agent_name)
+            self.get_logger().warning(
+                f"Lost Isaac telemetry for {self.team_name}/{agent_name} "
+                f"(last odom {age:.1f}s ago); re-requesting spawn"
+            )
 
     def _clear_stale_pending_spawn_calls(self, now: float) -> None:
         for agent_name in list(self.pending_spawn_agents):
@@ -525,7 +796,7 @@ class IsaacTeamManager(Node):
             payload.setdefault("drive_backend", "cmd_vel")
             payload.setdefault("ros_namespace", namespace)
             payload.setdefault("ros_topic_identifier", namespace)
-            payload.setdefault("cmd_vel_topic", "/cmd_vel")
+            payload.setdefault("cmd_vel_topic", join_name(namespace, "cmd_vel"))
 
         request.resource_string = json.dumps(payload)
         return request
