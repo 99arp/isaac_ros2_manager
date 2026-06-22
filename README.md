@@ -1,59 +1,60 @@
 # isaac_ros2_manager
 
-Isaac Sim counterpart to `webots_ros2_manager`. It launches a **Webots-style team
-into Isaac Sim** and bridges the per-agent ROS contracts so the existing
-AUSPEX / CHIP-GT stack (planner, knowledge DB, web app, agent managers) drives
-the Isaac entities exactly as it drives Webots ones.
+Isaac-side helper package for the APE/Webots ROS contract.
 
-It is the productionised successor to the prototype `isaac_webots_compat`
-package, with two gaps closed:
+This package is **not** the Isaac platform adapter. The platform adapter lives in
+the Isaac Sim extension config/code:
 
-- **Proto-aware spawning** — each agent's Webots `proto` (e.g. `Mavic2ProSimple`,
-  `Scout`) selects the Isaac spawn type and defaults via a registry in
-  `common.py::_PROTO_REGISTRY`, instead of mapping only by `kind`.
-- **Named-location placement** — each agent's `location` (e.g. `area_00_l_init`)
-  is resolved to a pose via the mission/area model, instead of index stacking.
+`/home/qnc/Desktop/pip_isaacsim/env_isaacsim/lib/python3.11/site-packages/isaacsim/extsUser/auspex.platform_interface/auspex_platform_interface_python/config/config.jsonnet`
 
-## Nodes
+The active `integration_config` statically spawns the Isaac scene. Isaac owns
+static world readiness and simulator/sensor output. Real platform adapters, such
+as the AUSPEX-AERO bridge in `uav_ranger_manager`, provide control
+services/actions consumed by the platform-agnostic skills.
 
-| Executable | Node | Role |
-|---|---|---|
-| `isaac_team_manager_node` | `team_manager` | Reads the team JSON, spawns each agent through `/world_manager/add` (`simulation_interfaces/srv/SpawnEntity`), runs a per-agent `AgentBridge`, serves `move_to_area` / `sweep_area`, mirrors platform state into the knowledge DB. |
-| `isaac_env_manager_node` | `env_manager` | Areas, objectives, occupancy map, `/clock`, and the objective/area services the upstream stack expects. |
-| `isaac_agent_bridge_node` | `isaac_agent_bridge` | Standalone single-agent bridge (the same `AgentBridge` the team manager hosts inline). |
+Static objective state is the one simulator contract kept in this ROS package:
+`isaac_objective_state_node` loads known trap/objective positions from
+`config/integration_objectives.json`, publishes the Webots-compatible
+`area_objectives` KNOW document, merges YOLO detections, and serves the
+per-agent `detect`/`disarm` actions used by the skill managers.
 
-## How a team becomes an Isaac world
+## What Remains Here
 
-```
-teams/isaac.json ──► team_manager
-   per agent:
-     proto/kind   ──► resolve_proto() ──► uri (drone|carter) + resource defaults
-     location     ──► MissionModel.location_xy() ──► local ENU x,y
-     (origin_*)   ──► lat_lon_from_xy() ──► GPS lat/lon/alt in resource_string
-   ──► SpawnEntity ──► /world_manager/add  (auspex world_manager.py)
-   ──► AgentBridge: cmd_vel/set_target/navigate_to_pose ⇄ Isaac topics
-```
+| Executable | Role |
+|---|---|
+| `isaac_startup_ready_node` | Passive startup reporter. It republishes `/world_manager/ready` as `/isaac_integration/ready`; it does not create map, objectives, clock, or KNOW data. |
+| `isaac_objective_state_node` | Loads configured static objectives, publishes `/auspex_know/knowledge_collector/area_objectives`, consumes `/<team>/team_manager/detected_objectives`, and serves `/<team>/<agent>/{detect,disarm}`. |
+| `isaac_yolo_detection_adapter_node` | Converts Isaac camera detections into the existing trap-detection pose topic. |
 
-## Coordinate frames — set the origin
+`isaac_team.launch.py` starts the objective-state node and the existing UAV/UGV
+skill managers. For UAVs it also starts the AUSPEX-AERO platform adapter that
+backs `takeoff`, `land`, and `navigate_to_pose`. It does not start an Isaac team
+manager and does not spawn agents.
 
-The Webots stack works in **local ENU metres**; the Isaac `world_manager`
-spawners are documented in **GPS**. Set `origin_lat` / `origin_lon` / `origin_alt`
-to the scene's geo-anchor so agents land in the right place. When the origin is
-left at `0,0`, the manager falls back to handing the spawner local metres via the
-`SpawnEntity` initial pose instead of emitting null-island GPS.
+## Removed
 
-## Launch
+The previous `AgentBridge` and `isaac_team_manager_node` path has been removed.
+There is no `/world_manager/add` fallback for agents and no synthetic odometry
+bridge. If a required endpoint is missing, fix the component that owns that
+endpoint: Isaac for static scene/sensors, AUSPEX-AERO or another platform
+adapter for flight control, and KNOW/mission publishers for area/objective state.
 
-```bash
-# Whole team into a running Isaac Sim (world_manager must be up)
-ros2 launch isaac_ros2_manager isaac_team.launch.py \
-  team:=isaac origin_lat:=47.836292 origin_lon:=11.614310 edge_size:=250.0
+## Expected Isaac Contract
 
-# Environment/objectives services only
-ros2 launch isaac_ros2_manager isaac_env.launch.py grid_size:=1 edge_size:=250.0
-```
+For `TEAM=chipgt`:
 
-## Reset semantics
+- UAV `mini1`: `/chipgt/mini1/odometry`, `/chipgt/mini1/is_flying`,
+  `/chipgt/mini1/takeoff`, `/chipgt/mini1/land`,
+  `/chipgt/mini1/navigate_to_pose`, `/chipgt/mini1/detect`,
+  `/chipgt/mini1/disarm`, `/chipgt/mini1/front_camera/image_raw`.
+  `takeoff`, `land`, and `navigate_to_pose` may be provided by the
+  AUSPEX-AERO adapter rather than the Isaac extension.
+- UGV `irobot2`: `/chipgt/irobot2/odom`, `/chipgt/irobot2/cmd_vel`,
+  `/chipgt/irobot2/navigate_to_pose`, `/chipgt/irobot2/detect`,
+  `/chipgt/irobot2/disarm`
+- KNOW collectors: `/auspex_know/knowledge_collector/team_data`,
+  `/auspex_know/knowledge_collector/area_data`,
+  `/auspex_know/knowledge_collector/area_objectives`
 
-Teardown of live Isaac entities (especially drones with PX4/AERO) is **not**
-handled here by design — reset the world by restarting Isaac Sim, then relaunch.
+`/world_manager/ready` remains the startup barrier. It means the static Isaac
+scene is loaded and the rest of APE can start.

@@ -4,9 +4,8 @@
   <name>isaac_ros2_manager</name>
   <version>0.1.0</version>
   <description>
-    Isaac Sim counterpart to webots_ros2_manager: launches a Webots-style team/world
-    into Isaac Sim via the auspex world_manager spawn services and bridges the
-    per-agent ROS control contracts so the existing AUSPEX/Webots stack drives it.
+    Isaac Sim helper utilities for the APE/Webots ROS contracts. The Isaac
+    extension owns static scene spawn and the robot platform contract.
   </description>
 
   <maintainer email="prakash.jamakatel@yahoo.com">CHIP-GT</maintainer>
@@ -14,19 +13,11 @@
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>ample_msgs</exec_depend>
-  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>auspex_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>geographic_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
-  <exec_depend>nav2_msgs</exec_depend>
-  <exec_depend>rosgraph_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>webots_ros2_manager_msgs</exec_depend>
-  <exec_depend>simulation_interfaces</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

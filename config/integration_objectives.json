@@ -1,0 +1,27 @@
+{
+  "area_id": "area_00",
+  "objectives": [
+    {
+      "name": "area_00_objective_00",
+      "location": "area_00_l_00",
+      "type": "ground",
+      "status": "active",
+      "position": {
+        "x": 1.12,
+        "y": 2.22,
+        "theta": 0.0
+      }
+    },
+    {
+      "name": "area_00_objective_01",
+      "location": "area_00_l_01",
+      "type": "ground",
+      "status": "active",
+      "position": {
+        "x": 1.12,
+        "y": -2.22,
+        "theta": 0.8
+      }
+    }
+  ]
+}
