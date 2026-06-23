@@ -13,7 +13,11 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from .common import param_bool, param_string_array, yaw_from_quat
+from .common import PlanarFrameTransform, param_bool, param_string_array, yaw_from_quat
+
+
+def normalize_label(label: str) -> str:
+    return str(label).strip().lower().replace("-", "_").replace(" ", "_")
 
 
 @dataclass
@@ -43,8 +47,13 @@ class IsaacYoloDetectionAdapter(Node):
         self.declare_parameter("min_detections", 2)
         self.declare_parameter("merge_radius_m", 1.0)
         self.declare_parameter("publish_once", True)
-        self.declare_parameter("allowed_labels", "trap,bear_trap,bear-trap,landmine,mine")
-        self.declare_parameter("frame_id", "odom")
+        self.declare_parameter("allowed_labels", "trap,traps,bear_trap,bear-trap,bear trap,landmine,mine")
+        self.declare_parameter("edge_size", 1.0)
+        self.declare_parameter("world_offset", "0.0,0.0")
+        self.declare_parameter("nav_edge_size", 1.0)
+        self.declare_parameter("nav_world_offset", "0.0,0.0")
+        self.declare_parameter("output_coordinate_frame", "local")
+        self.declare_parameter("frame_id", "local")
 
         self.camera_fov_rad = math.radians(float(self.get_parameter("camera_fov_deg").value))
         self.ground_z = float(self.get_parameter("ground_z").value)
@@ -54,11 +63,22 @@ class IsaacYoloDetectionAdapter(Node):
         self.merge_radius_m = max(0.0, float(self.get_parameter("merge_radius_m").value))
         self.publish_once = param_bool(self.get_parameter("publish_once").value)
         self.allowed_labels = {
-            label.strip().lower()
+            normalize_label(label)
             for label in param_string_array(self.get_parameter("allowed_labels").value)
             if label.strip()
         }
-        self.frame_id = str(self.get_parameter("frame_id").value or "odom")
+        self.output_coordinate_frame = str(
+            self.get_parameter("output_coordinate_frame").value or "local"
+        ).strip().lower()
+        self.frame_transform = PlanarFrameTransform.from_values(
+            local_edge_size=self.get_parameter("edge_size").value,
+            local_offset=self.get_parameter("world_offset").value,
+            native_edge_size=self.get_parameter("nav_edge_size").value,
+            native_offset=self.get_parameter("nav_world_offset").value,
+        )
+        self.frame_id = str(self.get_parameter("frame_id").value or self.output_coordinate_frame)
+        if self._publishes_local_coordinates():
+            self.merge_radius_m = self.frame_transform.native_to_local_distance(self.merge_radius_m)
 
         self.odom: Odometry | None = None
         self.tracked: list[TrackedDetection] = []
@@ -74,7 +94,9 @@ class IsaacYoloDetectionAdapter(Node):
         self.get_logger().info(
             "Isaac YOLO detection adapter ready: "
             f"detections={detections_topic}; odom={odom_topic}; output={output_topic}; "
-            f"labels={sorted(self.allowed_labels) or ['*']}"
+            f"labels={sorted(self.allowed_labels) or ['*']}; "
+            f"output_frame={self.output_coordinate_frame}; "
+            f"native->local scale={self.frame_transform.native_to_local_scale:.3f}"
         )
 
     def _odom_cb(self, msg: Odometry) -> None:
@@ -101,7 +123,7 @@ class IsaacYoloDetectionAdapter(Node):
             if not isinstance(detection, dict):
                 continue
             label = str(detection.get("label", "")).strip()
-            label_key = label.lower()
+            label_key = normalize_label(label)
             if self.allowed_labels and label_key not in self.allowed_labels:
                 continue
             if float(detection.get("conf", 0.0)) < self.min_confidence:
@@ -111,7 +133,8 @@ class IsaacYoloDetectionAdapter(Node):
                 center_v = (float(detection["y1"]) + float(detection["y2"])) * 0.5
             except Exception:
                 continue
-            x, y = self._pixel_to_world(center_u, center_v, width, height)
+            native_x, native_y = self._pixel_to_world(center_u, center_v, width, height)
+            x, y = self._output_xy(native_x, native_y)
             self._track_detection(x, y, label or "trap")
 
     def _pixel_to_world(self, u: float, v: float, width: int, height: int) -> tuple[float, float]:
@@ -140,6 +163,14 @@ class IsaacYoloDetectionAdapter(Node):
         rot_x = rel_x * math.cos(yaw) - rel_y * math.sin(yaw)
         rot_y = rel_x * math.sin(yaw) + rel_y * math.cos(yaw)
         return float(pose.position.x) + rot_x, float(pose.position.y) + rot_y
+
+    def _publishes_local_coordinates(self) -> bool:
+        return self.output_coordinate_frame in ("local", "webots")
+
+    def _output_xy(self, native_x: float, native_y: float) -> tuple[float, float]:
+        if self._publishes_local_coordinates():
+            return self.frame_transform.native_to_local_xy(native_x, native_y)
+        return float(native_x), float(native_y)
 
     def _track_detection(self, x: float, y: float, label: str) -> None:
         now = time.monotonic()

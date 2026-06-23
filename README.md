@@ -32,6 +32,20 @@ and the existing UAV/UGV skill managers. For UAVs it also starts the AUSPEX-AERO
 platform adapter that backs `takeoff`, `land`, and `navigate_to_pose`. It does
 not spawn agents.
 
+## Coordinate Frames
+
+The ROS facade publishes Webots-compatible KNOW data in the local oracle frame.
+Native Isaac/Nav2 coordinates are converted with:
+
+`local = world_offset + (native - nav_world_offset) * edge_size / nav_edge_size`
+
+`WORLD=isaac` defaults `nav_edge_size` and `nav_world_offset` to the same values
+as the backend local frame. The active Isaac `integration_config` centers the
+terrain at the backend origin, so Isaac native XY is already backend/local XY.
+Override `ISAAC_WORLD_OFFSET`, `ISAAC_NAV_EDGE_SIZE`,
+`ISAAC_NAV_WORLD_OFFSET`, or `ISAAC_OBJECTIVES_FRAME` only when the Isaac scene
+uses a different native frame.
+
 ## Removed
 
 The previous synthetic `AgentBridge` path has been removed. There is no

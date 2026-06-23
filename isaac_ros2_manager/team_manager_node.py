@@ -13,7 +13,7 @@ import rclpy
 import yaml
 from ample_msgs.action import ExecutePlan
 from auspex_msgs.srv import UpsertSubframe
-from geometry_msgs.msg import Pose2D
+from geometry_msgs.msg import Pose2D, PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -22,7 +22,7 @@ from rclpy.node import Node
 from webots_ros2_manager_msgs.action import MoveToArea, SweepArea
 from webots_ros2_manager_msgs.msg import StringKnowledge
 
-from .common import param_float_array
+from .common import PlanarFrameTransform, best_effort_qos, param_float_array
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,9 @@ class IsaacTeamManagerNode(Node):
         self.declare_parameter("grid_size", 1)
         self.declare_parameter("edge_size", 100.0)
         self.declare_parameter("world_offset", "")
+        self.declare_parameter("nav_edge_size", 0.0)
+        self.declare_parameter("nav_world_offset", "")
+        self.declare_parameter("local_frame_id", "local")
         self.declare_parameter("execute_plan_action", "ample/execute_plan")
         self.declare_parameter("team_data_topic", "/auspex_know/knowledge_collector/team_data")
         self.declare_parameter("area_data_topic", "/auspex_know/knowledge_collector/area_data")
@@ -69,25 +72,34 @@ class IsaacTeamManagerNode(Node):
         self.areas = self._build_areas()
         if self.current_area_id not in self.areas:
             self.current_area_id = next(iter(self.areas))
+        self.nav_areas = self._build_nav_areas()
+        self.frame_transform = PlanarFrameTransform.from_values(
+            local_edge_size=self._edge_size(),
+            local_offset=self._world_offset(),
+            native_edge_size=self._nav_edge_size(),
+            native_offset=self._nav_world_offset(),
+        )
+        self.local_frame_id = str(self.get_parameter("local_frame_id").value or "local")
 
         self.agent_poses = {agent: self._default_odometry(agent) for agent in self._agents()}
         self.odom_subscriptions = []
+        sensor_qos = best_effort_qos()
         for agent in self._agents():
-            self.odom_subscriptions.append(
-                self.create_subscription(
-                    Odometry,
-                    f"{agent}/odom",
-                    lambda msg, agent=agent: self._odom_cb(msg, agent),
-                    10,
-                    callback_group=self.cb_group,
-                )
-            )
             self.odom_subscriptions.append(
                 self.create_subscription(
                     Odometry,
                     f"{agent}/odometry",
                     lambda msg, agent=agent: self._odom_cb(msg, agent),
-                    10,
+                    sensor_qos,
+                    callback_group=self.cb_group,
+                )
+            )
+            self.odom_subscriptions.append(
+                self.create_subscription(
+                    PoseStamped,
+                    f"{agent}/pose",
+                    lambda msg, agent=agent: self._pose_cb(msg, agent),
+                    sensor_qos,
                     callback_group=self.cb_group,
                 )
             )
@@ -129,7 +141,10 @@ class IsaacTeamManagerNode(Node):
 
         self.get_logger().info(
             f"Isaac team manager ready for {self.team_id}: "
-            f"areas={len(self.areas)} current={self.current_area_id} agents={list(self._agents())}"
+            f"areas={len(self.areas)} current={self.current_area_id} agents={list(self._agents())}; "
+            f"native->local scale={self.frame_transform.native_to_local_scale:.3f} "
+            f"native_offset={self.frame_transform.native_offset} "
+            f"local_offset={self.frame_transform.local_offset}"
         )
 
     def move_to_area_callback(self, goal_handle):
@@ -143,8 +158,8 @@ class IsaacTeamManagerNode(Node):
             result.message = "bad area id"
             return result
 
-        target_pose = self._goal_pose_in_area(request.position_in_area, target_area)
-        if not target_area.contains(target_pose.x, target_pose.y):
+        target_pose_local = self._goal_pose_in_area(request.position_in_area, target_area)
+        if not target_area.contains(target_pose_local.x, target_pose_local.y):
             goal_handle.abort()
             result.success = False
             result.message = "bad area position"
@@ -156,13 +171,25 @@ class IsaacTeamManagerNode(Node):
             result.message = "arrived"
             return result
 
+        nav_target_area = self.nav_areas.get(request.area_id)
+        target_pose = self._local_pose_to_native(target_pose_local)
+        if nav_target_area is not None and not nav_target_area.contains(target_pose.x, target_pose.y):
+            self.get_logger().warning(
+                f"Transformed Nav2 goal ({target_pose.x:.2f}, {target_pose.y:.2f}) "
+                f"is outside native bounds for {request.area_id}: {nav_target_area.bounds}"
+            )
+
         plan_goal = ExecutePlan.Goal()
         plan_goal.plan_as_string, inputs = self._move_plan(target_pose)
         plan_goal.plan_type = "rl"
         plan_goal.plan_input_yaml = yaml.safe_dump(inputs, sort_keys=False)
         plan_goal.reset_autorun_when_done = False
 
-        self.get_logger().info(f"Moving team {self.team_id} to {request.area_id}.")
+        self.get_logger().info(
+            f"Moving team {self.team_id} to {request.area_id} "
+            f"via local ({target_pose_local.x:.2f}, {target_pose_local.y:.2f}) "
+            f"-> native ({target_pose.x:.2f}, {target_pose.y:.2f}, {target_pose.theta:.2f})."
+        )
         plan_result = self._send_execute_plan(plan_goal)
         if plan_result is not None and plan_result.success:
             self.current_area_id = request.area_id
@@ -180,13 +207,13 @@ class IsaacTeamManagerNode(Node):
     def sweep_area_callback(self, goal_handle):
         request = goal_handle.request
         result = SweepArea.Result()
-        area = self.areas.get(request.area_id) if request.area_id else self.areas.get(self.current_area_id)
+        area_id = request.area_id if request.area_id else self.current_area_id
+        area = self.areas.get(area_id)
         if area is None:
             goal_handle.abort()
             result.success = False
             result.message = "bad area id"
             return result
-
         agent_name = request.agent_id or self._first_uav()
         if not agent_name:
             goal_handle.abort()
@@ -194,10 +221,11 @@ class IsaacTeamManagerNode(Node):
             result.message = "no uav in team"
             return result
 
-        target_pose = Pose2D()
-        target_pose.x = area.offset[0] + min(5.0, area.size[0] * 0.25)
-        target_pose.y = area.offset[1] + min(5.0, area.size[1] * 0.25)
-        target_pose.theta = float(request.altitude or 15.0)
+        target_pose_local = Pose2D()
+        target_pose_local.x = area.offset[0] + min(5.0, area.size[0] * 0.25)
+        target_pose_local.y = area.offset[1] + min(5.0, area.size[1] * 0.25)
+        target_pose_local.theta = float(request.altitude or 15.0)
+        target_pose = self._local_pose_to_native(target_pose_local)
 
         plan_goal = ExecutePlan.Goal()
         plan_goal.plan_as_string, inputs = self._move_plan(target_pose)
@@ -205,7 +233,11 @@ class IsaacTeamManagerNode(Node):
         plan_goal.plan_input_yaml = yaml.safe_dump(inputs, sort_keys=False)
         plan_goal.reset_autorun_when_done = False
 
-        self.get_logger().info(f"Sweeping {area.area_id} with {agent_name}.")
+        self.get_logger().info(
+            f"Sweeping {area.area_id} with {agent_name}: "
+            f"local ({target_pose_local.x:.2f}, {target_pose_local.y:.2f}) "
+            f"-> native ({target_pose.x:.2f}, {target_pose.y:.2f})."
+        )
         plan_result = self._send_execute_plan(plan_goal)
         if plan_result is not None and plan_result.success:
             goal_handle.succeed()
@@ -316,6 +348,14 @@ class IsaacTeamManagerNode(Node):
         pose.y = float(requested.y)
         return pose
 
+    def _local_pose_to_native(self, pose: Pose2D) -> Pose2D:
+        native_x, native_y = self.frame_transform.local_to_native_xy(pose.x, pose.y)
+        result = Pose2D()
+        result.x = native_x
+        result.y = native_y
+        result.theta = float(pose.theta)
+        return result
+
     def _publish_knowledge(self) -> None:
         self._publish_team_data()
         self._publish_area_data()
@@ -398,6 +438,7 @@ class IsaacTeamManagerNode(Node):
             "world_offset": list(self._world_offset()),
             "coordinate_system": "local",
             "coordinate_origin": [0.0, 0.0, 0.0],
+            "coordinate_transform": self.frame_transform.metadata(),
             "areas": {
                 area_id: {
                     "area_id": area.area_id,
@@ -410,19 +451,29 @@ class IsaacTeamManagerNode(Node):
 
     def _odom_cb(self, msg: Odometry, agent: str) -> None:
         self.agent_poses[agent] = self._odom_payload(msg, agent)
+        self._update_current_area_from_agent_poses()
+
+    def _pose_cb(self, msg: PoseStamped, agent: str) -> None:
+        self.agent_poses[agent] = self._pose_payload(msg, agent)
+        self._update_current_area_from_agent_poses()
 
     def _odom_payload(self, msg: Odometry, child_frame_id: str) -> dict[str, Any]:
+        local_x, local_y = self.frame_transform.native_to_local_xy(
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+        )
+        velocity_scale = self.frame_transform.native_to_local_scale
         return {
             "header": {
                 "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
-                "frame_id": str(msg.header.frame_id),
+                "frame_id": self.local_frame_id,
             },
             "child_frame_id": str(msg.child_frame_id or child_frame_id),
             "pose": {
                 "pose": {
                     "position": {
-                        "x": float(msg.pose.pose.position.x),
-                        "y": float(msg.pose.pose.position.y),
+                        "x": float(local_x),
+                        "y": float(local_y),
                         "z": float(msg.pose.pose.position.z),
                     },
                     "orientation": {
@@ -437,8 +488,8 @@ class IsaacTeamManagerNode(Node):
             "twist": {
                 "twist": {
                     "linear": {
-                        "x": float(msg.twist.twist.linear.x),
-                        "y": float(msg.twist.twist.linear.y),
+                        "x": float(msg.twist.twist.linear.x) * velocity_scale,
+                        "y": float(msg.twist.twist.linear.y) * velocity_scale,
                         "z": float(msg.twist.twist.linear.z),
                     },
                     "angular": {
@@ -451,17 +502,56 @@ class IsaacTeamManagerNode(Node):
             },
         }
 
-    def _default_odometry(self, child_frame_id: str) -> dict[str, Any]:
-        area = self.areas.get(self.current_area_id)
-        if area is None:
-            offset = self._world_offset()
-            x = offset[0] + 5.0
-            y = offset[1] + 5.0
-        else:
-            x = area.offset[0] + 5.0
-            y = area.offset[1] + 5.0
+    def _pose_payload(self, msg: PoseStamped, child_frame_id: str) -> dict[str, Any]:
+        local_x, local_y = self.frame_transform.native_to_local_xy(
+            msg.pose.position.x,
+            msg.pose.position.y,
+        )
         return {
-            "header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": "world"},
+            "header": {
+                "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
+                "frame_id": self.local_frame_id,
+            },
+            "child_frame_id": str(child_frame_id),
+            "pose": {
+                "pose": {
+                    "position": {
+                        "x": float(local_x),
+                        "y": float(local_y),
+                        "z": float(msg.pose.position.z),
+                    },
+                    "orientation": {
+                        "x": float(msg.pose.orientation.x),
+                        "y": float(msg.pose.orientation.y),
+                        "z": float(msg.pose.orientation.z),
+                        "w": float(msg.pose.orientation.w),
+                    },
+                },
+                "covariance": [0.0] * 36,
+            },
+            "twist": {
+                "twist": {
+                    "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                "covariance": [0.0] * 36,
+            },
+        }
+
+    def _default_odometry(self, child_frame_id: str) -> dict[str, Any]:
+        if hasattr(self, "frame_transform"):
+            x, y = self.frame_transform.native_to_local_xy(0.0, 0.0)
+        else:
+            area = self.areas.get(self.current_area_id)
+            if area is None:
+                offset = self._world_offset()
+                x = offset[0] + 5.0
+                y = offset[1] + 5.0
+            else:
+                x = area.offset[0] + 5.0
+                y = area.offset[1] + 5.0
+        return {
+            "header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": self.local_frame_id},
             "child_frame_id": str(child_frame_id),
             "pose": {
                 "pose": {
@@ -509,15 +599,19 @@ class IsaacTeamManagerNode(Node):
         return {
             "name": self.get_namespace().strip("/") or "chipgt",
             "area": "area_00",
-            "area_offset": [-125.0, -125.0],
+            "area_offset": [0.0, 0.0],
             "agents": {},
         }
 
     def _build_areas(self) -> dict[str, Area]:
+        return self._build_area_grid(self._edge_size(), self._world_offset())
+
+    def _build_nav_areas(self) -> dict[str, Area]:
+        return self._build_area_grid(self._nav_edge_size(), self._nav_world_offset())
+
+    def _build_area_grid(self, edge_size: float, world_offset: tuple[float, float]) -> dict[str, Area]:
         areas = {}
         grid_size = self._grid_size()
-        edge_size = self._edge_size()
-        world_offset = self._world_offset()
         index = 0
         for x in range(grid_size):
             for y in range(grid_size):
@@ -529,6 +623,33 @@ class IsaacTeamManagerNode(Node):
                 )
                 index += 1
         return areas
+
+    def _area_at(self, x: float, y: float) -> Area | None:
+        for area in self.areas.values():
+            if area.contains(x, y):
+                return area
+        return None
+
+    def _update_current_area_from_agent_poses(self) -> None:
+        if not self.agent_poses:
+            return
+        areas_seen = set()
+        for pose in self.agent_poses.values():
+            try:
+                position = pose["pose"]["pose"]["position"]
+                area = self._area_at(float(position["x"]), float(position["y"]))
+            except Exception:
+                return
+            if area is None:
+                return
+            areas_seen.add(area.area_id)
+        if len(areas_seen) != 1:
+            return
+        area_id = next(iter(areas_seen))
+        if area_id != self.current_area_id:
+            self.current_area_id = area_id
+            self.get_logger().info(f"Team {self.team_id} entered {self.current_area_id}.")
+            self._publish_knowledge()
 
     def _agents(self) -> dict[str, dict[str, Any]]:
         agents = self.team_config.get("agents")
@@ -573,6 +694,15 @@ class IsaacTeamManagerNode(Node):
             return max(1.0, float(values[0]) / float(self._grid_size()))
         return 100.0
 
+    def _nav_edge_size(self) -> float:
+        try:
+            value = float(self.get_parameter("nav_edge_size").value)
+            if math.isfinite(value) and value > 0.0:
+                return value
+        except Exception:
+            pass
+        return self._edge_size()
+
     def _world_offset(self) -> tuple[float, float]:
         values = param_float_array(self.get_parameter("world_offset").value)
         if len(values) >= 2:
@@ -580,7 +710,13 @@ class IsaacTeamManagerNode(Node):
         values = param_float_array(self.team_config.get("area_offset"))
         if len(values) >= 2:
             return float(values[0]), float(values[1])
-        return -125.0, -125.0
+        return 0.0, 0.0
+
+    def _nav_world_offset(self) -> tuple[float, float]:
+        values = param_float_array(self.get_parameter("nav_world_offset").value)
+        if len(values) >= 2:
+            return float(values[0]), float(values[1])
+        return self._world_offset()
 
 
 def main(args=None) -> None:

@@ -29,6 +29,8 @@ setup(
             "isaac_yolo_detection_adapter_node = isaac_ros2_manager.yolo_detection_adapter_node:main",
             "isaac_objective_state_node = isaac_ros2_manager.objective_state_node:main",
             "isaac_team_manager_node = isaac_ros2_manager.team_manager_node:main",
+            "isaac_pose_odometry_bridge_node = isaac_ros2_manager.pose_odometry_bridge_node:main",
+            "isaac_cmd_vel_bridge_node = isaac_ros2_manager.cmd_vel_bridge_node:main",
         ],
     },
 )

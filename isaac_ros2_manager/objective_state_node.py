@@ -17,7 +17,7 @@ from auspex_msgs.srv import UpsertSubframe
 from webots_ros2_manager_msgs.action import ObjectiveAction
 from webots_ros2_manager_msgs.msg import Objective, StringKnowledge
 
-from .common import param_float_array, param_string_array, yaw_from_quat
+from .common import PlanarFrameTransform, param_float_array, param_string_array, yaw_from_quat
 
 
 @dataclass
@@ -62,9 +62,16 @@ class IsaacObjectiveStateNode(Node):
         self.declare_parameter("publish_area_data", True)
         self.declare_parameter("direct_know_write", True)
         self.declare_parameter("area_size", [250.0, 250.0])
-        self.declare_parameter("area_offset", [-125.0, -125.0])
+        self.declare_parameter("area_offset", [0.0, 0.0])
+        self.declare_parameter("edge_size", 0.0)
+        self.declare_parameter("world_offset", [0.0, 0.0])
+        self.declare_parameter("nav_edge_size", 0.0)
+        self.declare_parameter("nav_world_offset", [0.0, 0.0])
         self.declare_parameter("coordinate_system", "local")
         self.declare_parameter("coordinate_origin", [0.0, 0.0, 0.0])
+        self.declare_parameter("objectives_coordinate_frame", "native")
+        self.declare_parameter("detections_coordinate_frame", "local")
+        self.declare_parameter("local_frame_id", "local")
         self.declare_parameter("default_objective_type", "ground")
         self.declare_parameter("merge_radius_m", 1.0)
         self.declare_parameter("match_tolerance_m", 3.0)
@@ -80,6 +87,19 @@ class IsaacObjectiveStateNode(Node):
         self.records: dict[str, ObjectiveRecord] = {}
         self.action_servers: list[ActionServer] = []
         self.team_config = self._load_team_config()
+        self.local_frame_id = str(self.get_parameter("local_frame_id").value or "local")
+        self.objectives_coordinate_frame = str(
+            self.get_parameter("objectives_coordinate_frame").value or "native"
+        ).strip().lower()
+        self.detections_coordinate_frame = str(
+            self.get_parameter("detections_coordinate_frame").value or "local"
+        ).strip().lower()
+        self.frame_transform = PlanarFrameTransform.from_values(
+            local_edge_size=self._local_edge_size(),
+            local_offset=self._area_offset(),
+            native_edge_size=self._native_edge_size(),
+            native_offset=self._native_offset(),
+        )
 
         detected_topic = str(self.get_parameter("detected_objectives_topic").value or "")
         if not detected_topic:
@@ -140,7 +160,8 @@ class IsaacObjectiveStateNode(Node):
             f"detections={detected_topic}; area_objectives={area_objectives_topic}; "
             f"team_data={team_data_topic}; area_data={area_data_topic}; "
             f"publish_team_data={self.publish_team_data}; publish_area_data={self.publish_area_data}; "
-            f"objectives={len(self.records)}; agents={self._action_agents()}"
+            f"objectives={len(self.records)}; agents={self._action_agents()}; "
+            f"native->local scale={self.frame_transform.native_to_local_scale:.3f}"
         )
 
     def _action_agents(self) -> list[str]:
@@ -252,11 +273,13 @@ class IsaacObjectiveStateNode(Node):
             return
 
         gps = item.get("gps_position") if isinstance(item.get("gps_position"), dict) else {}
+        input_frame = str(item.get("coordinate_frame", self.objectives_coordinate_frame) or "native")
+        x, y = self._xy_to_local(position[0], position[1], input_frame)
         self.records[name] = ObjectiveRecord(
             name=name,
             location=str(item.get("location") or f"{self.area_id}_l_{index:02d}"),
-            x=position[0],
-            y=position[1],
+            x=x,
+            y=y,
             theta=position[2],
             type=self._objective_type_from_value(item.get("type", self.default_objective_type)),
             status=self._status_from_value(item.get("status", Objective.ACTIVE)),
@@ -282,8 +305,11 @@ class IsaacObjectiveStateNode(Node):
         return None
 
     def _detected_objective_cb(self, msg: PoseStamped) -> None:
-        x = float(msg.pose.position.x)
-        y = float(msg.pose.position.y)
+        x, y = self._xy_to_local(
+            msg.pose.position.x,
+            msg.pose.position.y,
+            self._detection_frame(msg),
+        )
         theta = yaw_from_quat(msg.pose.orientation)
 
         record = self._nearest_record_euclidean(x, y, self.merge_radius_m)
@@ -547,9 +573,10 @@ class IsaacObjectiveStateNode(Node):
             "grid_size": 1,
             "edge_size": edge_size,
             "world_size": edge_size,
-            "world_offset": 0,
+            "world_offset": self._area_offset(),
             "coordinate_system": str(self.get_parameter("coordinate_system").value or "local"),
             "coordinate_origin": self._coordinate_origin(),
+            "coordinate_transform": self.frame_transform.metadata(),
             "areas": {
                 self.area_id: {
                     "area_id": self.area_id,
@@ -560,6 +587,12 @@ class IsaacObjectiveStateNode(Node):
         }
 
     def _area_size(self) -> list[float]:
+        try:
+            edge_size = float(self.get_parameter("edge_size").value)
+            if math.isfinite(edge_size) and edge_size > 0.0:
+                return [edge_size, edge_size]
+        except Exception:
+            pass
         from_team = self.team_config.get("area_size") if hasattr(self, "team_config") else None
         raw = from_team if from_team is not None else self.get_parameter("area_size").value
         values = param_float_array(raw)
@@ -568,12 +601,18 @@ class IsaacObjectiveStateNode(Node):
         return [250.0, 250.0]
 
     def _area_offset(self) -> list[float]:
+        try:
+            values = param_float_array(self.get_parameter("world_offset").value)
+            if len(values) >= 2:
+                return [float(values[0]), float(values[1])]
+        except Exception:
+            pass
         from_team = self.team_config.get("area_offset") if hasattr(self, "team_config") else None
         raw = from_team if from_team is not None else self.get_parameter("area_offset").value
         values = param_float_array(raw)
         if len(values) >= 2:
             return [float(values[0]), float(values[1])]
-        return [-125.0, -125.0]
+        return [0.0, 0.0]
 
     def _area_bounds(self) -> list[list[float]]:
         offset = self._area_offset()
@@ -582,6 +621,46 @@ class IsaacObjectiveStateNode(Node):
             [offset[0], offset[0] + size[0]],
             [offset[1], offset[1] + size[1]],
         ]
+
+    def _local_edge_size(self) -> float:
+        try:
+            value = float(self.get_parameter("edge_size").value)
+            if math.isfinite(value) and value > 0.0:
+                return value
+        except Exception:
+            pass
+        size = self._area_size()
+        return max(1.0, float(size[0]))
+
+    def _native_edge_size(self) -> float:
+        try:
+            value = float(self.get_parameter("nav_edge_size").value)
+            if math.isfinite(value) and value > 0.0:
+                return value
+        except Exception:
+            pass
+        return self._local_edge_size()
+
+    def _native_offset(self) -> list[float]:
+        values = param_float_array(self.get_parameter("nav_world_offset").value)
+        if len(values) >= 2:
+            return [float(values[0]), float(values[1])]
+        return self._area_offset()
+
+    def _xy_to_local(self, x: float, y: float, coordinate_frame: str) -> tuple[float, float]:
+        frame = str(coordinate_frame or "local").strip().lower()
+        if frame in ("native", "isaac", "isaacsim", "nav", "nav2", "world", "odom", "map"):
+            return self.frame_transform.native_to_local_xy(float(x), float(y))
+        return float(x), float(y)
+
+    def _detection_frame(self, msg: PoseStamped) -> str:
+        configured = self.detections_coordinate_frame
+        if configured != "auto":
+            return configured
+        frame_id = str(msg.header.frame_id or "").strip().lower()
+        if frame_id == self.local_frame_id.lower() or frame_id in ("local", "webots"):
+            return "local"
+        return "native"
 
     def _coordinate_origin(self) -> list[float]:
         values = param_float_array(self.get_parameter("coordinate_origin").value)
@@ -608,7 +687,7 @@ class IsaacObjectiveStateNode(Node):
         x = float(offset[0]) + 5.0
         y = float(offset[1]) + 5.0
         return {
-            "header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": "world"},
+            "header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": self.local_frame_id},
             "child_frame_id": str(child_frame_id),
             "pose": {
                 "pose": {
