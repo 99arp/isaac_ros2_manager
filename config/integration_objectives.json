@@ -2,25 +2,36 @@
   "area_id": "area_00",
   "objectives": [
     {
-      "name": "area_00_objective_00",
-      "location": "area_00_l_00",
+      "name": "area_00_objective_02",
+      "location": "area_00_l_02",
       "type": "ground",
       "status": "active",
       "position": {
-        "x": 1.12,
-        "y": 2.22,
+        "x": -20.5,
+        "y": -7.5,
         "theta": 0.0
       }
     },
     {
-      "name": "area_00_objective_01",
-      "location": "area_00_l_01",
+      "name": "area_00_objective_03",
+      "location": "area_00_l_03",
       "type": "ground",
       "status": "active",
       "position": {
-        "x": 1.12,
-        "y": -2.22,
-        "theta": 0.8
+        "x": 50.0,
+        "y": 25.0,
+        "theta": 0.0
+      }
+    },
+    {
+      "name": "area_00_objective_09",
+      "location": "area_00_l_09",
+      "type": "ground",
+      "status": "active",
+      "position": {
+        "x": 30.0,
+        "y": 50.0,
+        "theta": 0.0
       }
     }
   ]

@@ -12,7 +12,6 @@ from typing import Any
 import rclpy
 import yaml
 from ample_msgs.action import ExecutePlan
-from auspex_msgs.srv import UpsertSubframe
 from geometry_msgs.msg import Pose2D, PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient, ActionServer
@@ -23,6 +22,11 @@ from webots_ros2_manager_msgs.action import MoveToArea, SweepArea
 from webots_ros2_manager_msgs.msg import StringKnowledge
 
 from .common import PlanarFrameTransform, best_effort_qos, param_float_array
+
+try:
+    from auspex_msgs.srv import UpsertSubframe
+except ModuleNotFoundError:
+    UpsertSubframe = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,7 @@ class IsaacTeamManagerNode(Node):
         self.declare_parameter("area_data_topic", "/auspex_know/knowledge_collector/area_data")
         self.declare_parameter("direct_know_write", True)
         self.declare_parameter("publish_period_s", 2.0)
+        self.declare_parameter("uav_cruise_height_agl_m", 15.0)
 
         self.team_config = self._load_team_config()
         self.team_id = str(self.team_config.get("name") or self.get_namespace().strip("/") or "chipgt")
@@ -80,20 +85,24 @@ class IsaacTeamManagerNode(Node):
             native_offset=self._nav_world_offset(),
         )
         self.local_frame_id = str(self.get_parameter("local_frame_id").value or "local")
+        self.uav_cruise_height_agl_m = float(
+            self.get_parameter("uav_cruise_height_agl_m").value or 15.0
+        )
 
         self.agent_poses = {agent: self._default_odometry(agent) for agent in self._agents()}
         self.odom_subscriptions = []
         sensor_qos = best_effort_qos()
         for agent in self._agents():
-            self.odom_subscriptions.append(
-                self.create_subscription(
-                    Odometry,
-                    f"{agent}/odometry",
-                    lambda msg, agent=agent: self._odom_cb(msg, agent),
-                    sensor_qos,
-                    callback_group=self.cb_group,
+            for odom_topic in (f"{agent}/odometry", f"{agent}/odom"):
+                self.odom_subscriptions.append(
+                    self.create_subscription(
+                        Odometry,
+                        odom_topic,
+                        lambda msg, agent=agent: self._odom_cb(msg, agent),
+                        sensor_qos,
+                        callback_group=self.cb_group,
+                    )
                 )
-            )
             self.odom_subscriptions.append(
                 self.create_subscription(
                     PoseStamped,
@@ -109,7 +118,14 @@ class IsaacTeamManagerNode(Node):
         self.team_data_pub = self.create_publisher(StringKnowledge, team_data_topic, 10)
         self.area_data_pub = self.create_publisher(StringKnowledge, area_data_topic, 10)
         self.direct_know_write = bool(self.get_parameter("direct_know_write").value)
-        self.know_upsert_client = self.create_client(UpsertSubframe, "/auspex_know/upsert_subframe")
+        self.know_upsert_client = None
+        if self.direct_know_write and UpsertSubframe is not None:
+            self.know_upsert_client = self.create_client(UpsertSubframe, "/auspex_know/upsert_subframe")
+        elif self.direct_know_write:
+            self.direct_know_write = False
+            self.get_logger().warning(
+                "auspex_msgs is not available; continuing with topic-only knowledge publishing."
+            )
         self._know_upsert_unavailable_logged = False
 
         execute_plan_action = str(self.get_parameter("execute_plan_action").value or "ample/execute_plan")
@@ -215,28 +231,28 @@ class IsaacTeamManagerNode(Node):
             result.message = "bad area id"
             return result
         agent_name = request.agent_id or self._first_uav()
-        if not agent_name:
+        agent = self._agents().get(agent_name) if agent_name else None
+        if agent is None or self._agent_kind(agent) != "uav":
             goal_handle.abort()
             result.success = False
             result.message = "no uav in team"
             return result
 
-        target_pose_local = Pose2D()
-        target_pose_local.x = area.offset[0] + min(5.0, area.size[0] * 0.25)
-        target_pose_local.y = area.offset[1] + min(5.0, area.size[1] * 0.25)
-        target_pose_local.theta = float(request.altitude or 15.0)
-        target_pose = self._local_pose_to_native(target_pose_local)
+        altitude = float(request.altitude or 15.0)
+        nav_area = self.nav_areas.get(area_id)
+        if nav_area is None:
+            goal_pose_native = self._local_pose_to_native(self._goal_pose_in_area(Pose2D(), area))
+            nav_area = Area(area.area_id, (goal_pose_native.x, goal_pose_native.y), area.size)
 
         plan_goal = ExecutePlan.Goal()
-        plan_goal.plan_as_string, inputs = self._move_plan(target_pose)
+        plan_goal.plan_as_string, inputs = self._sweep_plan(agent_name, nav_area, altitude)
         plan_goal.plan_type = "rl"
         plan_goal.plan_input_yaml = yaml.safe_dump(inputs, sort_keys=False)
         plan_goal.reset_autorun_when_done = False
 
         self.get_logger().info(
             f"Sweeping {area.area_id} with {agent_name}: "
-            f"local ({target_pose_local.x:.2f}, {target_pose_local.y:.2f}) "
-            f"-> native ({target_pose.x:.2f}, {target_pose.y:.2f})."
+            f"native bounds={nav_area.bounds} altitude={altitude:.2f}."
         )
         plan_result = self._send_execute_plan(plan_goal)
         if plan_result is not None and plan_result.success:
@@ -281,7 +297,13 @@ class IsaacTeamManagerNode(Node):
     def _move_plan(self, target_pose: Pose2D) -> tuple[str, dict[str, dict[str, float]]]:
         sections = {"robot": "", "input": "", "body": ""}
         inputs = {}
-        for index, (agent_name, agent) in enumerate(self._agents().items()):
+        agents = list(self._agents().items())
+        
+        ## this is here because othewise carter and drones were moving at the same times
+        
+        agents.sort(key=lambda item: 0 if self._agent_kind(item[1]) == "uav" else 1)
+
+        for index, (agent_name, agent) in enumerate(agents):
             kind = self._agent_kind(agent)
             agent_type = str(agent.get("type") or f"{kind}_ranger")
             sections["robot"] += f"\t\t{agent_name}: {agent_type}\n"
@@ -290,13 +312,16 @@ class IsaacTeamManagerNode(Node):
                 f"\t\tmove_{agent_name} {{ move_{kind}[{agent_name}](target_{agent_name}) "
                 "success.succeeded }\n"
             )
+            target_theta = float(target_pose.theta)
+            if kind == "uav" and target_theta <= 0.0:
+                target_theta = self.uav_cruise_height_agl_m
             inputs[f"target_{agent_name}"] = {
                 "x": float(target_pose.x),
                 "y": float(target_pose.y) + (2.0 * index),
-                "theta": float(target_pose.theta),
+                "theta": target_theta,
             }
 
-        return self._format_plan("parallel", "move_to_area", sections), inputs
+        return self._format_plan("sequence", "move_to_area", sections), inputs
 
     def _sweep_plan(
         self,
@@ -377,7 +402,7 @@ class IsaacTeamManagerNode(Node):
     def _upsert_know_subframe(self, frame: str, msg: StringKnowledge) -> None:
         if not self.direct_know_write:
             return
-        if not self.know_upsert_client.wait_for_service(timeout_sec=0.0):
+        if self.know_upsert_client is None or not self.know_upsert_client.wait_for_service(timeout_sec=0.0):
             if not self._know_upsert_unavailable_logged:
                 self.get_logger().warning(
                     "AUSPEX-KNOW upsert service is not available; "
