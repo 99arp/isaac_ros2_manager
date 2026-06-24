@@ -266,7 +266,7 @@ class IsaacObjectiveStateNode(Node):
             self.get_logger().warning(f"Ignoring objective without position: {item!r}")
             return
 
-        index = len(self.records)
+        index = self._next_record_index()
         name = str(item.get("name") or f"{self.area_id}_objective_{index:02d}")
         if name in self.records:
             self.get_logger().warning(f"Ignoring duplicate objective {name!r}")
@@ -326,7 +326,7 @@ class IsaacObjectiveStateNode(Node):
         self._publish_area_objectives()
 
     def _create_record(self, x: float, y: float, theta: float) -> ObjectiveRecord:
-        index = len(self.records)
+        index = self._next_record_index()
         name = f"{self.area_id}_objective_{index:02d}"
         record = ObjectiveRecord(
             name=name,
@@ -339,6 +339,12 @@ class IsaacObjectiveStateNode(Node):
         )
         self.records[name] = record
         return record
+
+    def _next_record_index(self) -> int:
+        index = 0
+        while f"{self.area_id}_objective_{index:02d}" in self.records:
+            index += 1
+        return index
 
     def _merge_record_position(self, record: ObjectiveRecord, x: float, y: float, theta: float) -> None:
         n = max(1, record.detections)
@@ -497,7 +503,7 @@ class IsaacObjectiveStateNode(Node):
         locations = {
             f"{self.area_id}_l_init": {
                 "type": "Waypoint",
-                "data": {"x": 5.0, "y": 5.0, "theta": 0.0},
+                "data": {"x": 0.0, "y": 0.0, "theta": 0.0},
             }
         }
         objectives = {}
@@ -684,8 +690,8 @@ class IsaacObjectiveStateNode(Node):
 
     def _default_odometry(self, child_frame_id: str) -> dict[str, Any]:
         offset = self._area_offset()
-        x = float(offset[0]) + 5.0
-        y = float(offset[1]) + 5.0
+        x = float(offset[0])
+        y = float(offset[1])
         return {
             "header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": self.local_frame_id},
             "child_frame_id": str(child_frame_id),

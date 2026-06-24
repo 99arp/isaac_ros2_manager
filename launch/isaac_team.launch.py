@@ -6,10 +6,10 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from ament_index_python.packages import PackageNotFoundError
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 
 
 def _as_bool(value: str) -> bool:
@@ -52,6 +52,155 @@ def _format_action_topic(template: str, team_ns: str, agent_name: str, index: in
         return str(template)
 
 
+def _resolve_package_launch_file(launch_dict: dict) -> str:
+    launch_file = str(launch_dict.get("launch") or "").strip()
+    if not launch_file:
+        raise ValueError("Agent launch stanza is missing 'launch'")
+    if os.path.isabs(launch_file):
+        return launch_file
+
+    launch_pkg = str(launch_dict.get("package") or "").strip()
+    if not launch_pkg:
+        raise ValueError(f"Relative launch file {launch_file!r} needs a package")
+    return os.path.join(get_package_share_directory(launch_pkg), "launch", launch_file)
+
+
+def _float_launch_param(params: dict, key: str, default: float) -> float:
+    try:
+        return float(params.pop(key, default))
+    except Exception:
+        return float(default)
+
+
+def _carter_odom_tf_node(
+    team_ns: str,
+    agent_name: str,
+    native_odometry_topic: str,
+    sensor_parent_frame_id: str,
+    sensor_frame_id: str,
+    sensor_x: float,
+    sensor_y: float,
+    sensor_z: float,
+    use_native_odom_stamp: bool,
+):
+    node_ns = f"/{team_ns}/{agent_name}"
+    return Node(
+        package="isaac_ros2_manager",
+        executable="isaac_carter_odom_tf_node",
+        name="isaac_carter_odom_tf",
+        namespace=node_ns,
+        output="screen",
+        remappings=[
+            ("/tf", f"{node_ns}/tf"),
+            ("/tf_static", f"{node_ns}/tf_static"),
+        ],
+        parameters=[{
+            "native_odom_topic": native_odometry_topic,
+            "odom_topic": f"{node_ns}/odom",
+            "map_frame_id": "map",
+            "odom_frame_id": "odom",
+            "base_frame_id": "base_link",
+            "base_footprint_frame_id": "base_footprint",
+            "publish_map_to_odom": True,
+            "publish_base_footprint": True,
+            "force_2d": True,
+            "use_native_odom_stamp": use_native_odom_stamp,
+            "sensor_parent_frame_id": sensor_parent_frame_id,
+            "sensor_frame_id": sensor_frame_id,
+            "sensor_x": sensor_x,
+            "sensor_y": sensor_y,
+            "sensor_z": sensor_z,
+            "use_sim_time": False,
+        }],
+    )
+
+
+def _twist_relay_node(
+    team_ns: str,
+    agent_name: str,
+    input_topic: str,
+    output_topic: str,
+):
+    node_ns = f"/{team_ns}/{agent_name}"
+    return Node(
+        package="isaac_ros2_manager",
+        executable="isaac_twist_relay_node",
+        name="isaac_carter_cmd_vel_relay",
+        namespace=node_ns,
+        output="screen",
+        parameters=[{
+            "input_topic": input_topic,
+            "output_topic": output_topic,
+        }],
+    )
+
+
+def _ugv_agent_launch(team_ns: str, agent_name: str, agent_dict: dict):
+    agent_launch = agent_dict.get("launch") or {}
+    launch_file = _resolve_package_launch_file(agent_launch)
+    node_ns = f"/{team_ns}/{agent_name}"
+    launch_params = dict(agent_launch.get("params") or {})
+
+    native_odometry_topic = str(
+        launch_params.pop("isaac_native_odometry_topic", f"{node_ns}/chassis/odom")
+    ).strip()
+    native_cmd_vel_topic = str(
+        launch_params.pop("isaac_native_cmd_vel_topic", "")
+    ).strip()
+    scan_topic = str(launch_params.pop("isaac_scan_topic", f"{node_ns}/scan")).strip()
+    publish_odom_tf = _as_bool(launch_params.pop("isaac_publish_odom_tf", "True"))
+    use_native_odom_stamp = _as_bool(launch_params.pop("isaac_odom_tf_use_native_stamp", "False"))
+    sensor_parent_frame_id = str(
+        launch_params.pop("isaac_lidar_parent_frame", "base_footprint")
+    ).strip()
+    sensor_frame_id = str(
+        launch_params.pop("isaac_lidar_frame", "front_3d_lidar")
+    ).strip()
+    sensor_x = _float_launch_param(launch_params, "isaac_lidar_x", 0.43)
+    sensor_y = _float_launch_param(launch_params, "isaac_lidar_y", 0.0)
+    sensor_z = _float_launch_param(launch_params, "isaac_lidar_z", 0.10)
+
+    launch_arguments = {
+        "ns": team_ns,
+        "robot_name": agent_name,
+        "objective_actions": "False",
+        "cmd_vel_stamped": "False",
+        "launch_control_node": "False" if publish_odom_tf else "True",
+    }
+    launch_arguments.update({str(k): str(v) for k, v in launch_params.items()})
+
+    actions = []
+    if publish_odom_tf and native_odometry_topic:
+        actions.append(_carter_odom_tf_node(
+            team_ns,
+            agent_name,
+            native_odometry_topic,
+            sensor_parent_frame_id,
+            sensor_frame_id,
+            sensor_x,
+            sensor_y,
+            sensor_z,
+            use_native_odom_stamp,
+        ))
+    elif native_odometry_topic and native_odometry_topic != f"{node_ns}/odometry":
+        actions.append(SetRemap(src=f"{node_ns}/odometry", dst=native_odometry_topic))
+    if scan_topic and scan_topic != f"{node_ns}/scan":
+        actions.append(SetRemap(src=f"{node_ns}/scan", dst=scan_topic))
+    if native_cmd_vel_topic and native_cmd_vel_topic != f"{node_ns}/cmd_vel":
+        actions.append(_twist_relay_node(
+            team_ns,
+            agent_name,
+            f"{node_ns}/cmd_vel",
+            native_cmd_vel_topic,
+        ))
+
+    actions.append(IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(launch_file),
+        launch_arguments=launch_arguments.items(),
+    ))
+    return GroupAction(actions=actions)
+
+
 def _parse_xy(value: str, fallback: list[float]) -> list[float]:
     try:
         parts = json.loads(str(value))
@@ -87,6 +236,12 @@ def _aero_bridge_node(
     takeoff_action: str,
     land_action: str,
     fly_3d_action: str,
+    local_waypoints: bool,
+    local_origin_lat_deg: float,
+    local_origin_lon_deg: float,
+    local_origin_alt_amsl_m: float,
+    local_yaw_deg: float,
+    default_cruise_height_agl_m: float,
 ):
     node_ns = f"/{team_ns}/{agent_name}"
     return Node(
@@ -99,222 +254,14 @@ def _aero_bridge_node(
             "takeoff_action": takeoff_action,
             "land_action": land_action,
             "fly_3d_action": fly_3d_action,
+            "local_waypoints": local_waypoints,
+            "local_origin_lat_deg": local_origin_lat_deg,
+            "local_origin_lon_deg": local_origin_lon_deg,
+            "local_origin_alt_amsl_m": local_origin_alt_amsl_m,
+            "local_yaw_deg": local_yaw_deg,
+            "default_cruise_height_agl_m": default_cruise_height_agl_m,
         }],
     )
-
-
-def _uav_pose_odometry_bridge_node(team_ns: str, agent_name: str):
-    node_ns = f"/{team_ns}/{agent_name}"
-    return Node(
-        package="isaac_ros2_manager",
-        executable="isaac_pose_odometry_bridge_node",
-        name=f"{agent_name}_pose_odometry_bridge",
-        output="screen",
-        parameters=[{
-            "pose_topic": f"{node_ns}/pose",
-            "odom_topics": f"{node_ns}/odometry,{node_ns}/odom",
-            "frame_id": "world",
-            "child_frame_id": agent_name,
-            "use_sim_time": False,
-        }],
-    )
-
-
-def _same_type_relay_node(
-    source_topic: str,
-    target_topic: str,
-    output_type: str,
-    expression: str,
-    name: str,
-    qos_reliability: str = "reliable",
-):
-    return Node(
-        package="topic_tools",
-        executable="relay_field",
-        name=name,
-        output="screen",
-        arguments=[
-            source_topic,
-            target_topic,
-            output_type,
-            expression,
-            "--wait-for-start",
-            "--qos-reliability",
-            qos_reliability,
-        ],
-        parameters=[{"use_sim_time": False}],
-    )
-
-
-def _twist_stamped_to_twist_bridge_node(source_topic: str, target_topic: str, name: str):
-    return Node(
-        package="isaac_ros2_manager",
-        executable="isaac_cmd_vel_bridge_node",
-        name=name,
-        output="screen",
-        parameters=[{
-            "source_topic": source_topic,
-            "target_topic": target_topic,
-            "use_sim_time": False,
-        }],
-    )
-
-
-def _carter_native_bridge_nodes(team_ns: str, agent_name: str, controller_type: str):
-    node_ns = f"/{team_ns}/{agent_name}"
-    controller_type = str(controller_type or "").strip().lower()
-    nodes = [
-        _same_type_relay_node(
-            "/chassis/odom",
-            f"{node_ns}/odometry",
-            "nav_msgs/msg/Odometry",
-            "{header: m.header, child_frame_id: m.child_frame_id, pose: m.pose, twist: m.twist}",
-            f"{agent_name}_isaac_odom_to_odometry",
-        ),
-        _same_type_relay_node(
-            "/chassis/odom",
-            f"{node_ns}/odom",
-            "nav_msgs/msg/Odometry",
-            "{header: m.header, child_frame_id: m.child_frame_id, pose: m.pose, twist: m.twist}",
-            f"{agent_name}_isaac_odom_to_odom",
-        ),
-        _same_type_relay_node(
-            "/chassis/odom",
-            f"{node_ns}/odom_matcher",
-            "nav_msgs/msg/Odometry",
-            "{header: m.header, child_frame_id: m.child_frame_id, pose: m.pose, twist: m.twist}",
-            f"{agent_name}_isaac_odom_to_odom_matcher",
-        ),
-        _same_type_relay_node(
-            "/chassis/imu",
-            f"{node_ns}/imu",
-            "sensor_msgs/msg/Imu",
-            (
-                "{header: m.header, orientation: m.orientation, "
-                "orientation_covariance: m.orientation_covariance, "
-                "angular_velocity: m.angular_velocity, "
-                "angular_velocity_covariance: m.angular_velocity_covariance, "
-                "linear_acceleration: m.linear_acceleration, "
-                "linear_acceleration_covariance: m.linear_acceleration_covariance}"
-            ),
-            f"{agent_name}_isaac_imu",
-        ),
-    ]
-    if controller_type == "nav2":
-        nodes.extend([
-            Node(
-                package="tf2_ros",
-                executable="static_transform_publisher",
-                name=f"{agent_name}_front_lidar_tf",
-                namespace=node_ns,
-                output="screen",
-                remappings=[
-                    ("/tf", f"{node_ns}/tf"),
-                    ("/tf_static", f"{node_ns}/tf_static"),
-                ],
-                arguments=[
-                    "--x", "0.15",
-                    "--z", "0.25",
-                    "--frame-id", "base_link",
-                    "--child-frame-id", "front_3d_lidar",
-                ],
-            ),
-            Node(
-                package="pointcloud_to_laserscan",
-                executable="pointcloud_to_laserscan_node",
-                name=f"{agent_name}_pointcloud_to_scan",
-                namespace=node_ns,
-                output="screen",
-                remappings=[
-                    ("cloud_in", "/front_3d_lidar/lidar_points"),
-                    ("scan", f"{node_ns}/scan_raw"),
-                    ("/tf", f"{node_ns}/tf"),
-                    ("/tf_static", f"{node_ns}/tf_static"),
-                ],
-                parameters=[{
-                    "target_frame": "",
-                    "transform_tolerance": 0.05,
-                    "min_height": -0.5,
-                    "max_height": 1.5,
-                    "angle_min": -3.14159,
-                    "angle_max": 3.14159,
-                    "angle_increment": 0.0087,
-                    "scan_time": 0.1,
-                    "range_min": 0.05,
-                    "range_max": 5.0,
-                    "use_inf": True,
-                    "inf_epsilon": 1.0,
-                    "use_sim_time": False,
-                }],
-            ),
-            _same_type_relay_node(
-                f"{node_ns}/scan_raw",
-                f"{node_ns}/scan",
-                "sensor_msgs/msg/LaserScan",
-                (
-                    "{header: {stamp: now, frame_id: m.header.frame_id}, "
-                    "angle_min: m.angle_min, angle_max: m.angle_max, "
-                    "angle_increment: m.angle_increment, time_increment: m.time_increment, "
-                    "scan_time: m.scan_time, range_min: m.range_min, range_max: m.range_max, "
-                    "ranges: m.ranges, intensities: m.intensities}"
-                ),
-                f"{agent_name}_restamp_scan",
-                qos_reliability="best_effort",
-            ),
-        ])
-    return nodes
-
-
-def _agent_launch_include(team_ns: str, agent_name: str, agent_dict: dict):
-    agent_launch = agent_dict.get("launch")
-    if not agent_launch:
-        return None
-    launch_pkg = agent_launch.get("package")
-    launch_file = agent_launch.get("launch")
-    if not os.path.isabs(launch_file):
-        launch_file = os.path.join(
-            get_package_share_directory(launch_pkg),
-            "launch",
-            launch_file,
-        )
-    launch_arguments = {
-        "ns": team_ns,
-        "robot_name": agent_name,
-    }
-    for key, value in agent_launch.get("params", {}).items():
-        launch_arguments[key] = str(value)
-    return IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(launch_file),
-        launch_arguments=launch_arguments.items(),
-    )
-
-
-def _agent_controller_type(agent_dict: dict, requested_controller_type: str) -> str:
-    requested = str(requested_controller_type or "").strip().lower()
-    if requested and requested != "auto":
-        return requested
-    agent_launch = agent_dict.get("launch") or {}
-    launch_params = agent_launch.get("params") or {}
-    configured = str(launch_params.get("controller_type") or "").strip().lower()
-    return configured or "nav2"
-
-
-def _ugv_movement_actions(team_ns: str, agent_name: str, _controller_type: str):
-    node_ns = f"/{team_ns}/{agent_name}"
-    manager = Node(
-        package="ugv_ranger_manager",
-        executable="ugv_ranger_manager_node",
-        namespace=node_ns,
-        output="screen",
-        remappings=[
-            ("~/odometry", f"{node_ns}/odom"),
-            ("navigate_to_pose", f"{node_ns}/navigate_to_pose"),
-            ("detect", f"{node_ns}/detect"),
-            ("disarm", f"{node_ns}/disarm"),
-        ],
-        parameters=[{"use_sim_time": False}],
-    )
-    return [manager]
 
 
 def _skill_manager_node(team_ns: str, agent_name: str, agent_dict: dict):
@@ -338,6 +285,8 @@ def _skill_manager_node(team_ns: str, agent_name: str, agent_dict: dict):
             parameters=[{"use_sim_time": True}],
         )
     if kind == "ugv":
+        if agent_dict.get("launch"):
+            return _ugv_agent_launch(team_ns, agent_name, agent_dict)
         return Node(
             package="ugv_ranger_manager",
             executable="ugv_ranger_manager_node",
@@ -349,7 +298,7 @@ def _skill_manager_node(team_ns: str, agent_name: str, agent_dict: dict):
                 ("detect", f"{node_ns}/detect"),
                 ("disarm", f"{node_ns}/disarm"),
             ],
-            parameters=[{"use_sim_time": True}],
+            parameters=[{"use_sim_time": False}],
         )
     raise ValueError(f"Unsupported Isaac skill manager kind for {agent_name}: {kind}")
 
@@ -419,6 +368,7 @@ def _team_manager_node(
     nav_world_offset: str,
     team_data_topic: str,
     area_data_topic: str,
+    uav_cruise_height_agl_m: str,
 ):
     grid_size_value = max(1, int(float(grid_size)))
     edge_size_value = float(edge_size)
@@ -438,6 +388,7 @@ def _team_manager_node(
             "nav_world_offset": nav_world_offset,
             "team_data_topic": team_data_topic,
             "area_data_topic": area_data_topic,
+            "uav_cruise_height_agl_m": float(uav_cruise_height_agl_m),
             "use_sim_time": False,
         }],
     )
@@ -450,11 +401,6 @@ def _team_setup(context, *args, **kwargs):
         team_dict = json.load(f)
 
     team_ns = team_dict["name"]
-    launch_agents = _as_bool(LaunchConfiguration("launch_agents").perform(context))
-    launch_ugv_agent_launches = _as_bool(LaunchConfiguration("launch_ugv_agent_launches").perform(context))
-    launch_carter_native_bridge = _as_bool(LaunchConfiguration("launch_carter_native_bridge").perform(context))
-    launch_uav_pose_odometry_bridge = _as_bool(LaunchConfiguration("launch_uav_pose_odometry_bridge").perform(context))
-    ugv_controller_type = LaunchConfiguration("ugv_controller_type").perform(context)
     launch_skill_managers = _as_bool(LaunchConfiguration("launch_skill_managers").perform(context))
     launch_aero_bridges = _as_bool(LaunchConfiguration("launch_aero_bridges").perform(context))
     launch_objective_state = _as_bool(LaunchConfiguration("launch_objective_state").perform(context))
@@ -472,6 +418,16 @@ def _team_setup(context, *args, **kwargs):
     aero_takeoff_action = LaunchConfiguration("aero_takeoff_action").perform(context)
     aero_land_action = LaunchConfiguration("aero_land_action").perform(context)
     aero_fly_3d_action = LaunchConfiguration("aero_fly_3d_action").perform(context)
+    aero_local_waypoints = _as_bool(LaunchConfiguration("aero_local_waypoints").perform(context))
+    aero_local_origin_lat_deg = float(LaunchConfiguration("aero_local_origin_lat_deg").perform(context))
+    aero_local_origin_lon_deg = float(LaunchConfiguration("aero_local_origin_lon_deg").perform(context))
+    aero_local_origin_alt_amsl_m = float(
+        LaunchConfiguration("aero_local_origin_alt_amsl_m").perform(context)
+    )
+    aero_local_yaw_deg = float(LaunchConfiguration("aero_local_yaw_deg").perform(context))
+    aero_default_cruise_height_agl_m = float(LaunchConfiguration(
+        "aero_default_cruise_height_agl_m"
+    ).perform(context))
     actions = []
     agent_names = list(team_dict.get("agents", {}).keys())
 
@@ -506,12 +462,8 @@ def _team_setup(context, *args, **kwargs):
             nav_world_offset,
             team_data_topic,
             area_data_topic,
+            aero_default_cruise_height_agl_m,
         ))
-
-    if launch_uav_pose_odometry_bridge:
-        for agent_name, agent_dict in team_dict.get("agents", {}).items():
-            if _agent_kind(agent_dict) == "uav":
-                actions.append(_uav_pose_odometry_bridge_node(team_ns, agent_name))
 
     uav_index = 0
     if launch_aero_bridges:
@@ -525,33 +477,16 @@ def _team_setup(context, *args, **kwargs):
                 _format_action_topic(aero_takeoff_action, team_ns, agent_name, uav_index),
                 _format_action_topic(aero_land_action, team_ns, agent_name, uav_index),
                 _format_action_topic(aero_fly_3d_action, team_ns, agent_name, uav_index),
+                aero_local_waypoints,
+                aero_local_origin_lat_deg,
+                aero_local_origin_lon_deg,
+                aero_local_origin_alt_amsl_m,
+                aero_local_yaw_deg,
+                aero_default_cruise_height_agl_m,
             ))
-
-    launched_agent_launches = set()
-    if launch_ugv_agent_launches:
-        for agent_name, agent_dict in team_dict.get("agents", {}).items():
-            if _agent_kind(agent_dict) != "ugv":
-                continue
-            resolved_ugv_controller_type = _agent_controller_type(agent_dict, ugv_controller_type)
-            actions.extend(_ugv_movement_actions(team_ns, agent_name, resolved_ugv_controller_type))
-            launched_agent_launches.add(agent_name)
-            if launch_carter_native_bridge:
-                actions.extend(_carter_native_bridge_nodes(team_ns, agent_name, resolved_ugv_controller_type))
-
-    if launch_agents:
-        for agent_name, agent_dict in team_dict.get("agents", {}).items():
-            if agent_name in launched_agent_launches:
-                continue
-            agent_launch = _agent_launch_include(team_ns, agent_name, agent_dict)
-            if agent_launch is None:
-                continue
-            actions.append(agent_launch)
-            launched_agent_launches.add(agent_name)
 
     if launch_skill_managers:
         for agent_name, agent_dict in team_dict.get("agents", {}).items():
-            if agent_name in launched_agent_launches:
-                continue
             actions.append(_skill_manager_node(team_ns, agent_name, agent_dict))
 
     return actions
@@ -565,15 +500,13 @@ def generate_launch_description():
     )
     return LaunchDescription([
         DeclareLaunchArgument("team", default_value="None"),
-        DeclareLaunchArgument("launch_agents", default_value="False"),
-        DeclareLaunchArgument("launch_ugv_agent_launches", default_value="True"),
-        DeclareLaunchArgument("launch_carter_native_bridge", default_value="False"),
-        DeclareLaunchArgument("launch_uav_pose_odometry_bridge", default_value="False"),
-        DeclareLaunchArgument("ugv_controller_type", default_value=os.environ.get("ISAAC_UGV_CONTROLLER_TYPE", "auto")),
         DeclareLaunchArgument("launch_skill_managers", default_value="True"),
         DeclareLaunchArgument("launch_aero_bridges", default_value="True"),
         DeclareLaunchArgument("launch_objective_state", default_value="True"),
-        DeclareLaunchArgument("launch_team_manager", default_value="True"),
+        DeclareLaunchArgument(
+            "launch_team_manager",
+            default_value=os.environ.get("ISAAC_LAUNCH_TEAM_MANAGER", "True"),
+        ),
         DeclareLaunchArgument("grid_size", default_value=os.environ.get("GRID_SIZE", "4")),
         DeclareLaunchArgument("edge_size", default_value=os.environ.get("EDGE_SIZE", "40.0")),
         DeclareLaunchArgument("world_offset", default_value=os.environ.get("ISAAC_WORLD_OFFSET", "0.0,0.0")),
@@ -610,6 +543,30 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "aero_fly_3d_action",
             default_value=os.environ.get("ISAAC_AERO_FLY_3D_ACTION", "/{team}_{agent}/fm/fly_3d"),
+        ),
+        DeclareLaunchArgument(
+            "aero_local_waypoints",
+            default_value=os.environ.get("ISAAC_AERO_LOCAL_WAYPOINTS", "True"),
+        ),
+        DeclareLaunchArgument(
+            "aero_local_origin_lat_deg",
+            default_value=os.environ.get("ISAAC_AERO_LOCAL_ORIGIN_LAT_DEG", "47.836262"),
+        ),
+        DeclareLaunchArgument(
+            "aero_local_origin_lon_deg",
+            default_value=os.environ.get("ISAAC_AERO_LOCAL_ORIGIN_LON_DEG", "11.614310"),
+        ),
+        DeclareLaunchArgument(
+            "aero_local_origin_alt_amsl_m",
+            default_value=os.environ.get("ISAAC_AERO_LOCAL_ORIGIN_ALT_AMSL_M", "0.0"),
+        ),
+        DeclareLaunchArgument(
+            "aero_local_yaw_deg",
+            default_value=os.environ.get("ISAAC_AERO_LOCAL_YAW_DEG", "0.0"),
+        ),
+        DeclareLaunchArgument(
+            "aero_default_cruise_height_agl_m",
+            default_value=os.environ.get("ISAAC_AERO_DEFAULT_CRUISE_HEIGHT_AGL_M", "15.0"),
         ),
         OpaqueFunction(function=_team_setup),
     ])
